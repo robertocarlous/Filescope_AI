@@ -1,0 +1,54 @@
+{
+  "name": "filescope-ai-sdk",
+  "version": "1.0.0",
+  "description": "Official SDK for FileScope AI - AI-powered dataset analysis and quality assessment",
+  "main": "dist/index.js",
+  "module": "dist/index.esm.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rollup -c",
+    "dev": "rollup -c -w",
+    "test": "jest",
+    "lint": "eslint src --ext .ts,.tsx",
+    "format": "prettier --write src/**/*.{ts,tsx}"
+  },
+  "keywords": [
+    "ai",
+    "data-analysis",
+    "data-quality",
+    "machine-learning",
+    "dataset",
+    "analytics",
+    "typescript",
+    "javascript"
+  ],
+  "author": "FileScope AI",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Abidoyesimze/FileScopeAI.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Abidoyesimze/FileScopeAI/issues"
+  },
+  "homepage": "https://filescope.ai/sdk",
+  "peerDependencies": {
+    "react": ">=16.8.0"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^25.0.0",
+    "@rollup/plugin-node-resolve": "^15.0.0",
+    "@rollup/plugin-typescript": "^11.0.0",
+    "@types/react": "^18.0.0",
+    "rollup": "^3.0.0",
+    "rollup-plugin-dts": "^5.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+} 

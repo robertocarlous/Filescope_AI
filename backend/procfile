@@ -1,0 +1,6 @@
+web: gunicorn filescope_ai.wsgi:application \
+  --workers=3 \
+  --timeout=120 \
+  --bind=0.0.0.0:8000 \
+  --max-requests=1000 \
+  --max-requests-jitter=50
