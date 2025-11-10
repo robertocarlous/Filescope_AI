@@ -1,19 +1,24 @@
 import matplotlib
+
 matplotlib.use('Agg')
-import pandas as pd
-import numpy as np
-import json
-import os
-import io
 import base64
+import io
+import json
 import logging
-from django.core.files.storage import default_storage
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
+import os
+from typing import Any, Dict, List
+
+import mammoth
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import seaborn as sns
+from sklearn.ensemble import IsolationForest
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+
 from .models import DatasetAnalysis
+from .reporting import generate_pdf_report
 
 logger = logging.getLogger(__name__)
 plt.style.use('seaborn-v0_8')
@@ -21,7 +26,7 @@ sns.set_theme(style="whitegrid")
 plt.rcParams['figure.figsize'] = (10, 6)
 plt.rcParams['axes.labelsize'] = 12
 
-ALLOWED_EXTENSIONS = {'.csv', '.json', '.xlsx', '.xls', '.parquet'}
+ALLOWED_EXTENSIONS = {'.csv', '.json', '.xlsx', '.xls', '.parquet', '.doc', '.docx'}
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
 
 def load_dataset(file_path):
@@ -36,10 +41,36 @@ def load_dataset(file_path):
             return pd.read_excel(file_path)
         elif ext == '.parquet':
             return pd.read_parquet(file_path)
+        elif ext in ['.doc', '.docx']:
+            return load_word_document(file_path)
         return pd.read_csv(file_path)  # Try CSV as default
     except Exception as e:
         logger.error(f"Error loading dataset: {str(e)}")
         return None
+
+
+def load_word_document(file_path: str) -> pd.DataFrame:
+    """Convert DOC/DOCX files into a simple text dataframe."""
+    try:
+        with open(file_path, "rb") as doc_file:
+            result = mammoth.extract_raw_text(doc_file)
+        raw_text = (result.value or "").strip()
+    except Exception as exc:
+        logger.error("Failed to extract text from Word document %s: %s", file_path, exc)
+        raise
+
+    if not raw_text:
+        return pd.DataFrame({'text': []})
+
+    rows = [
+        line.strip()
+        for line in raw_text.splitlines()
+        if line.strip()
+    ]
+    if not rows:
+        rows = [raw_text]
+
+    return pd.DataFrame({'text': rows})
 
 def get_basic_statistics(df):
     """Generate basic dataset statistics"""
@@ -286,7 +317,7 @@ def plot_to_base64(fig):
     return img_base64
 
     
-def process_dataset(analysis_id):
+def process_dataset(analysis_id: int):
     """
     Main function to process uploaded dataset with AI analysis (synchronous version)
     """
@@ -312,6 +343,48 @@ def process_dataset(analysis_id):
             'visualizations': create_visualizations(df)
         }
         
+        # Generate branded PDF report
+        pdf_metadata = {
+            "headline": {
+                "dataset_name": os.path.basename(analysis.dataset_file.name),
+                "dimensions": f"{df.shape[0]} x {df.shape[1]}",
+                "uploaded_at": analysis.uploaded_at.isoformat(),
+                "quality_score": results['quality_analysis']['overall_score'],
+            },
+            "quality": {
+                "completeness": results['quality_analysis']['component_scores']['missing_data_score'],
+                "duplicates": results['quality_analysis']['component_scores']['duplicate_score'],
+                "schema": results['quality_analysis']['component_scores']['consistency_score'],
+            },
+            "anomalies": {
+                "count": results['anomaly_detection']['total_anomalies'],
+                "critical": results['anomaly_detection'].get('critical', 0),
+                "moderate": results['anomaly_detection'].get('moderate', 0),
+            },
+            "bias": {
+                "score": results['bias_analysis']['overall_bias_score'],
+                "assessment": "high" if results['bias_analysis']['overall_bias_score'] < 70 else "moderate"
+                if results['bias_analysis']['overall_bias_score'] < 85
+                else "low",
+                "fields": results['bias_analysis'].get('bias_issues', []),
+            },
+            "insights": (
+                [results['insights']['summary']]
+                + results['insights'].get('key_findings', [])
+                + results['insights'].get('recommendations', [])
+            ),
+        }
+
+        pdf_report_path = None
+        try:
+            pdf_report_path = generate_pdf_report(
+                analysis_id=analysis.id,
+                metadata=pdf_metadata,
+            )
+            logger.info("Generated PDF report for analysis %s at %s", analysis.id, pdf_report_path)
+        except Exception as pdf_error:  # pragma: no cover - best effort
+            logger.warning("Failed to generate PDF report for analysis %s: %s", analysis.id, pdf_error)
+
         # Update analysis record
         analysis.quality_score = results['quality_analysis']['overall_score']
         analysis.anomaly_count = results['anomaly_detection']['total_anomalies']
@@ -319,6 +392,8 @@ def process_dataset(analysis_id):
         analysis.dataset_size = f"{df.shape[0]} rows, {df.shape[1]} columns"
         analysis.key_insights = results['insights']
         analysis.visualization_data = results['visualizations']
+        analysis.full_analysis = results
+
         analysis.status = 'completed'
         analysis.save()
         

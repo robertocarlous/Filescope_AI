@@ -58,7 +58,7 @@ class DatasetAnalysis(models.Model):
     key_insights = models.JSONField(default=dict, blank=True)
     visualization_data = models.JSONField(default=dict, blank=True)
     full_analysis = models.JSONField(default=dict)
-    
+
     def __str__(self):
         return f"Analysis #{self.id} - {self.status}"
     
