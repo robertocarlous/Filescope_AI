@@ -27,9 +27,13 @@ const wagmiAdapter = new WagmiAdapter({
 
 export const wagmiConfig = wagmiAdapter.wagmiConfig;
 
+// AppKit configuration options
 export const appKitOptions: CreateAppKit = {
   projectId,
   adapters: [wagmiAdapter],
   networks,
   metadata,
 };
+
+// Export networks for use in components
+export const appKitNetworks = networks;

@@ -3,13 +3,16 @@ import React, { useState, useRef, useCallback, useMemo, useEffect } from 'react'
 import { 
   Upload, FileText, Database, CheckCircle, AlertCircle, 
   X, ArrowRight, BarChart3, Shield, Zap, 
-  FileSpreadsheet, Code, Info, Loader, Eye
+  FileSpreadsheet, Code, Info, Loader, Eye,
+  DollarSign, Cloud
 } from 'lucide-react';
 import { useAccount, useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
 import { useRouter } from 'next/navigation';
 import toast from 'react-hot-toast';
 import { analysisAPI } from '../../services/analysisApi';
 import { fileStoreContract } from '../index';
+import { FilecoinCloudService, getFilecoinCloudService } from '../../services/filecoinCloud';
+import { PaymentSetupModal } from '../../components/PaymentSetupModal';
 
 // Pinata IPFS configuration
 const PINATA_API_KEY = process.env.NEXT_PUBLIC_PINATA_API_KEY;
@@ -54,14 +57,22 @@ const FileScopeApp = () => {
   
   // Results states  
   const [isPublic, setIsPublic] = useState(false);
+  const [isPaid, setIsPaid] = useState(false);
+  const [priceInFIL, setPriceInFIL] = useState<string>('');
 
   // New state for tracking analysis data
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [analysisResults, setAnalysisResults] = useState<any>(null);
   const [ipfsHash, setIpfsHash] = useState<string | null>(null);
+  const [focPieceCid, setFocPieceCid] = useState<string | null>(null);
+
+  // FOC service and payment setup
+  const [focService, setFocService] = useState<FilecoinCloudService | null>(null);
+  const [showPaymentSetup, setShowPaymentSetup] = useState(false);
+  const [isCheckingPayment, setIsCheckingPayment] = useState(false);
 
   // Wallet connection check
-  const { isConnected } = useAccount();
+  const { isConnected, address } = useAccount();
   const router = useRouter();
   const [mounted, setMounted] = useState(false);
 
@@ -116,11 +127,13 @@ const FileScopeApp = () => {
       fileName: uploadedFile?.name,
       fileSize: uploadedFile?.size,
       fileType: uploadedFile?.type,
-      isPublic
+      isPublic,
+      isPaid,
+      priceInFIL
     };
     sessionStorage.setItem('uploadState', JSON.stringify(state));
     console.log('💾 Saved state to sessionStorage:', state);
-  }, [currentStep, analysisProgress, currentAnalysisId, uploadedFile, isPublic]);
+  }, [currentStep, analysisProgress, currentAnalysisId, uploadedFile, isPublic, isPaid, priceInFIL]);
 
   // IPFS Upload Function using Pinata
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -420,18 +433,63 @@ const FileScopeApp = () => {
       
       setAnalysisResults(frontendResults); // Store results in state
       
-      // Step 4: Upload to IPFS
-      toast.loading('Storing results on IPFS...', { id: 'analysis' });
-      setAnalysisProgress(85);
-      saveState(); // Save state before IPFS upload
+      // Step 4: Upload dataset to storage (FOC for paid, IPFS for free)
+      let datasetCID: string;
       
-      const hash = await uploadToIPFS(uploadedFile!, frontendResults);
-      setIpfsHash(hash); // Store IPFS hash in state
+      if (isPaid && priceInFIL && parseFloat(priceInFIL) > 0) {
+        // Paid dataset: Upload to FOC
+        if (!focService) {
+          throw new Error('FOC service not initialized');
+        }
+
+        // Check payment setup
+        setIsCheckingPayment(true);
+        const paymentStatus = await focService.checkPaymentSetup();
+        setIsCheckingPayment(false);
+
+        if (paymentStatus.needsApproval || paymentStatus.needsDeposit) {
+          // Show payment setup modal
+          setShowPaymentSetup(true);
+          throw new Error('Payment setup required for paid datasets');
+        }
+
+        toast.loading('Uploading to Filecoin Onchain Cloud...', { id: 'analysis' });
+        setAnalysisProgress(85);
+        saveState();
+
+        // Upload to FOC
+        const focResult = await focService.uploadDataset(uploadedFile!, {
+          app: 'filescope-ai',
+          datasetName: uploadedFile!.name,
+          uploadedBy: address || '',
+          isPaid: 'true',
+          priceInFIL: priceInFIL,
+        });
+        
+        datasetCID = focResult.pieceCid;
+        setFocPieceCid(focResult.pieceCid);
+        toast.success('Dataset uploaded to FOC!', { id: 'analysis' });
+      } else {
+        // Free dataset: Upload to IPFS
+        toast.loading('Storing results on IPFS...', { id: 'analysis' });
+        setAnalysisProgress(85);
+        saveState();
+        
+        datasetCID = await uploadToIPFS(uploadedFile!, frontendResults);
+        setIpfsHash(datasetCID);
+      }
+
+      // Step 5: Upload analysis results to IPFS (always)
+      toast.loading('Storing analysis results on IPFS...', { id: 'analysis' });
+      setAnalysisProgress(90);
+      saveState();
       
-      // Step 5: Register on Blockchain
+      const analysisCID = await uploadToIPFS(uploadedFile!, frontendResults);
+      
+      // Step 6: Register on Blockchain
       toast.loading('Registering on blockchain...', { id: 'analysis' });
       setAnalysisProgress(95);
-      saveState(); // Save state before blockchain interaction
+      saveState();
       
       if (!writeContract) {
         throw new Error('Blockchain upload function not available');
@@ -440,18 +498,35 @@ const FileScopeApp = () => {
       if (!isConnected) {
         throw new Error('Wallet not connected');
       }
+
+      // Convert price to wei (FIL has 18 decimals)
+      const priceWei = isPaid && priceInFIL 
+        ? BigInt(Math.floor(parseFloat(priceInFIL) * 1e18))
+        : BigInt(0);
       
       console.log('🔗 Calling smart contract...');
       console.log('Contract address:', fileStoreContract.address);
-      console.log('IPFS hash:', hash);
+      console.log('Dataset CID:', datasetCID);
+      console.log('Analysis CID:', analysisCID);
       console.log('Is public:', isPublic);
+      console.log('Is private:', !isPublic);
+      console.log('Is paid:', isPaid);
+      console.log('Price in FIL:', priceInFIL);
+      console.log('Price in wei:', priceWei.toString());
       
-      // Call the smart contract
+      // Call the smart contract with all parameters
       writeContract({
         address: fileStoreContract.address as `0x${string}`,
         abi: fileStoreContract.abi,
         functionName: 'uploadDataset',
-        args: [hash, hash, isPublic], // datasetCID, analysisCID, isPublic
+        args: [
+          datasetCID,           // datasetCID (FOC PieceCID or IPFS CID)
+          analysisCID,          // analysisCID (IPFS CID)
+          isPublic,             // isPublic
+          !isPublic,            // isPrivate (inverse of isPublic for now)
+          isPaid,               // isPaid
+          priceWei,             // priceInFIL (in wei)
+        ],
       });
       
       console.log('✅ Smart contract call initiated...');
@@ -461,12 +536,21 @@ const FileScopeApp = () => {
       
     } catch (error) {
       console.error('Analysis monitoring failed:', error);
-      toast.error('Analysis monitoring failed. Please try again.', { id: 'analysis' });
-      setCurrentStep('preview');
-      setIsAnalyzing(false);
-      clearSavedState();
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      
+      // Don't show error toast if it's just payment setup required
+      if (!errorMessage.includes('Payment setup required')) {
+        toast.error(`Analysis monitoring failed: ${errorMessage}`, { id: 'analysis' });
+      }
+      
+      // Only reset if it's not a payment setup error
+      if (!errorMessage.includes('Payment setup required')) {
+        setCurrentStep('preview');
+        setIsAnalyzing(false);
+        clearSavedState();
+      }
     }
-  }, [uploadedFile, isPublic, uploadToIPFS, writeContract, isConnected, saveState, clearSavedState]);
+  }, [uploadedFile, isPublic, isPaid, priceInFIL, address, focService, uploadToIPFS, writeContract, isConnected, saveState, clearSavedState]);
 
   // ALL useEffect hooks MUST be called before any conditional logic
   // Set mounted state after component mounts
@@ -602,9 +686,26 @@ const FileScopeApp = () => {
     }
   }, [isConnected, router, mounted]);
 
+  // Initialize FOC service when wallet connects
+  useEffect(() => {
+    if (mounted && isConnected && window.ethereum && !focService) {
+      const service = getFilecoinCloudService();
+      service.initialize(window.ethereum)
+        .then(() => {
+          setFocService(service);
+          console.log('✅ FOC service initialized');
+        })
+        .catch((error) => {
+          console.error('❌ Failed to initialize FOC service:', error);
+          toast.error('Failed to initialize Filecoin Cloud service');
+        });
+    }
+  }, [mounted, isConnected, focService]);
+
   // Watch for transaction confirmation and navigate to results
   useEffect(() => {
-    if (mounted && isTransactionConfirmed && transactionReceipt && analysisResults && ipfsHash && uploadedFile) {
+    const hasDatasetHash = ipfsHash || focPieceCid;
+    if (mounted && isTransactionConfirmed && transactionReceipt && analysisResults && hasDatasetHash && uploadedFile) {
       console.log('✅ Transaction confirmed! Preparing navigation to results...');
       
       // Store results in sessionStorage for the results page
@@ -615,7 +716,10 @@ const FileScopeApp = () => {
         analysisId: currentAnalysisId,
         timestamp: new Date().toISOString(),
         isPublic: isPublic,
+        isPaid: isPaid,
+        priceInFIL: priceInFIL,
         ipfsHash: ipfsHash,
+        focPieceCid: focPieceCid,
         blockchainData: {
           transactionHash: blockchainData,
           blockNumber: transactionReceipt.blockNumber?.toString() || 'confirmed',
@@ -630,7 +734,9 @@ const FileScopeApp = () => {
       setAnalysisProgress(100);
       
       const visibilityMsg = isPublic 
-        ? 'Analysis completed and confirmed on blockchain! 🌐' 
+        ? isPaid
+          ? 'Paid dataset uploaded and confirmed on blockchain! 💰'
+          : 'Analysis completed and confirmed on blockchain! 🌐'
         : 'Analysis completed and confirmed on blockchain! 🔒';
       toast.success(visibilityMsg, { id: 'analysis' });
       
@@ -643,7 +749,7 @@ const FileScopeApp = () => {
         router.push('/results');
       }, 1000);
     }
-  }, [mounted, isTransactionConfirmed, transactionReceipt, analysisResults, ipfsHash, uploadedFile, currentAnalysisId, isPublic, blockchainData, router, clearSavedState]);
+  }, [mounted, isTransactionConfirmed, transactionReceipt, analysisResults, ipfsHash, focPieceCid, uploadedFile, currentAnalysisId, isPublic, isPaid, priceInFIL, blockchainData, router, clearSavedState]);
 
   // Watch for contract errors
   useEffect(() => {
@@ -807,7 +913,7 @@ const FileScopeApp = () => {
                   </div>
                 </div>
 
-                {/* IPFS Storage */}
+                {/* Storage (FOC for paid, IPFS for free) */}
                 <div className={`flex items-center space-x-4 p-4 rounded-lg border ${
                   analysisProgress > 85 
                     ? 'bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800' 
@@ -827,15 +933,23 @@ const FileScopeApp = () => {
                       analysisProgress > 85 ? 'text-green-900 dark:text-green-100' : 
                       analysisProgress > 80 ? 'text-blue-900 dark:text-blue-100' : 'text-gray-600 dark:text-gray-300'
                     }`}>
-                      IPFS Storage
+                      {isPaid ? 'Filecoin Onchain Cloud Storage' : 'IPFS Storage'}
                     </div>
                     <div className={`text-sm ${
                       analysisProgress > 85 ? 'text-green-700 dark:text-green-300' : 
                       analysisProgress > 80 ? 'text-blue-700 dark:text-blue-300' : 'text-gray-500 dark:text-gray-400'
                     }`}>
-                      {analysisProgress > 85 ? 'Results stored on IPFS' : 
-                       analysisProgress > 80 ? 'Uploading to decentralized storage...' : 
-                       'Pending IPFS storage'}
+                      {analysisProgress > 85 
+                        ? (isPaid 
+                          ? 'Dataset stored on FOC with verifiable proofs' 
+                          : 'Results stored on IPFS')
+                        : analysisProgress > 80 
+                          ? (isPaid 
+                            ? 'Uploading to Filecoin Onchain Cloud...' 
+                            : 'Uploading to decentralized storage...')
+                          : (isPaid 
+                            ? 'Pending FOC storage' 
+                            : 'Pending IPFS storage')}
                     </div>
                   </div>
                 </div>
@@ -1062,47 +1176,136 @@ const FileScopeApp = () => {
                   </div>
                 </div>
 
-                {/* Visibility Toggle */}
+              {/* Visibility Toggle */}
+              <div className="mb-6 p-4 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-600">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center space-x-3">
+                    <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${
+                      isPublic 
+                        ? 'bg-blue-50 dark:bg-blue-900/30' 
+                        : 'bg-gray-50 dark:bg-gray-700'
+                    }`}>
+                      {isPublic ? (
+                        <Eye className="w-5 h-5 text-blue-600" />
+                      ) : (
+                        <Shield className="w-5 h-5 text-gray-600 dark:text-gray-400" />
+                      )}
+                    </div>
+                    <div>
+                      <h5 className="font-medium text-gray-900 dark:text-white">
+                        {isPublic ? 'Public Dataset' : 'Private Dataset'}
+                      </h5>
+                      <p className="text-sm text-gray-600 dark:text-gray-400">
+                        {isPublic 
+                          ? 'Analysis will be visible to everyone in the explorer' 
+                          : 'Analysis will only be visible to you'
+                        }
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => {
+                      setIsPublic(!isPublic);
+                      // If making private, disable paid option (private datasets cannot be paid)
+                      if (!isPublic) {
+                        setIsPaid(false);
+                        setPriceInFIL('');
+                      }
+                    }}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${
+                      isPublic ? 'bg-blue-600' : 'bg-gray-200 dark:bg-gray-600'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                        isPublic ? 'translate-x-6' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+              </div>
+
+              {/* Paid Dataset Toggle (only for public datasets) */}
+              {isPublic && (
                 <div className="mb-6 p-4 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-600">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-start justify-between mb-4">
                     <div className="flex items-center space-x-3">
                       <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${
-                        isPublic 
-                          ? 'bg-blue-50 dark:bg-blue-900/30' 
+                        isPaid 
+                          ? 'bg-green-50 dark:bg-green-900/30' 
                           : 'bg-gray-50 dark:bg-gray-700'
                       }`}>
-                        {isPublic ? (
-                          <Eye className="w-5 h-5 text-blue-600" />
-                        ) : (
-                          <Shield className="w-5 h-5 text-gray-600 dark:text-gray-400" />
-                        )}
+                        <DollarSign className={`w-5 h-5 ${
+                          isPaid ? 'text-green-600' : 'text-gray-600 dark:text-gray-400'
+                        }`} />
                       </div>
                       <div>
                         <h5 className="font-medium text-gray-900 dark:text-white">
-                          {isPublic ? 'Public Dataset' : 'Private Dataset'}
+                          Monetize Dataset
                         </h5>
                         <p className="text-sm text-gray-600 dark:text-gray-400">
-                          {isPublic 
-                            ? 'Analysis will be visible to everyone in the explorer' 
-                            : 'Analysis will only be visible to you'
+                          {isPaid 
+                            ? 'Users will pay to download this dataset. Stored on Filecoin Onchain Cloud with verifiable proofs.' 
+                            : 'Make this dataset available for purchase. Requires FOC payment setup.'
                           }
                         </p>
                       </div>
                     </div>
                     <button
-                      onClick={() => setIsPublic(!isPublic)}
-                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${
-                        isPublic ? 'bg-blue-600' : 'bg-gray-200 dark:bg-gray-600'
+                      onClick={() => {
+                        setIsPaid(!isPaid);
+                        if (!isPaid) {
+                          setPriceInFIL('');
+                        }
+                      }}
+                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 ${
+                        isPaid ? 'bg-green-600' : 'bg-gray-200 dark:bg-gray-600'
                       }`}
                     >
                       <span
                         className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                          isPublic ? 'translate-x-6' : 'translate-x-1'
+                          isPaid ? 'translate-x-6' : 'translate-x-1'
                         }`}
                       />
                     </button>
                   </div>
+
+                  {isPaid && (
+                    <div className="mt-4 space-y-4">
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                          Price (FIL)
+                        </label>
+                        <input
+                          type="number"
+                          step="0.001"
+                          min="0"
+                          value={priceInFIL}
+                          onChange={(e) => setPriceInFIL(e.target.value)}
+                          placeholder="0.0"
+                          className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                        />
+                        <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                          Set the price buyers will pay to download this dataset
+                        </p>
+                      </div>
+
+                      <div className="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg p-3">
+                        <div className="flex items-start space-x-2">
+                          <Cloud className="w-4 h-4 text-green-600 dark:text-green-400 mt-0.5 flex-shrink-0" />
+                          <div className="text-sm text-green-800 dark:text-green-200">
+                            <p className="font-medium mb-1">Filecoin Onchain Cloud Storage</p>
+                            <p className="text-xs">
+                              Paid datasets are stored on FOC with verifiable proofs, CDN access, and programmable payments.
+                              {!focService && ' Payment setup required before upload.'}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
+              )}
 
                 <div className="flex items-center justify-between">
                   <div className="flex items-center space-x-2 text-sm text-gray-600 dark:text-gray-400">
@@ -1234,6 +1437,26 @@ const FileScopeApp = () => {
   return (
     <>
       {renderContent()}
+      
+      {/* Payment Setup Modal */}
+      {focService && (
+        <PaymentSetupModal
+          isOpen={showPaymentSetup}
+          onClose={() => {
+            setShowPaymentSetup(false);
+            setIsAnalyzing(false);
+            setCurrentStep('preview');
+          }}
+          onComplete={() => {
+            setShowPaymentSetup(false);
+            // Retry the upload after payment setup
+            if (uploadedFile && isPaid) {
+              continueAnalysisMonitoring(String(currentAnalysisId || ''));
+            }
+          }}
+          focService={focService}
+        />
+      )}
     </>
   );
 };

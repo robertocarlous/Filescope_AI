@@ -5,7 +5,7 @@ import { useAppKit, useAppKitNetwork } from '@reown/appkit/react';
 import { useAccount } from 'wagmi';
 import { Wallet } from 'lucide-react';
 import toast from 'react-hot-toast';
-import { appKitOptions } from '@/lib/web3';
+import { appKitNetworks } from '@/lib/web3';
 
 type AppKitView = 'Connect' | 'Networks' | 'Account';
 
@@ -15,7 +15,7 @@ export function ConnectWallet() {
   const { open } = useAppKit();
 
   const supportedChainIds = useMemo(
-    () => new Set(appKitOptions.networks.map((network) => network.id)),
+    () => new Set(appKitNetworks.map((network) => network.id)),
     []
   );
 
