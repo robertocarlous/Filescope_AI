@@ -1,7 +1,16 @@
 // FileScope AI API Service - SIMPLIFIED VERSION
 // Skip the problematic status endpoint, use direct results endpoint
 
-const API_BASE_URL = 'https://filescopeai-qdpp.onrender.com/api';
+const sanitizeBaseUrl = (input?: string) => {
+  if (!input) {
+    console.warn('⚠️ NEXT_PUBLIC_API_BASE_URL is not set. API requests will fail until it is configured.');
+    return '';
+  }
+  const trimmed = input.trim().replace(/\/$/, '');
+  return trimmed.endsWith('/api') ? trimmed : `${trimmed}/api`;
+};
+
+const API_BASE_URL = sanitizeBaseUrl(process.env.NEXT_PUBLIC_API_BASE_URL);
 const PINATA_JWT_SECRET = process.env.NEXT_PUBLIC_JWT_SECRET;
 
 console.log('🔧 FileScope AI API initialized with URL:', API_BASE_URL);
@@ -54,8 +63,21 @@ export interface UploadResponse {
   analysis_id: string | number;
   status?: 'completed' | 'processing' | 'pending' | 'failed';
   results?: {
-    metrics: AnalysisMetrics;
-    insights: AnalysisInsights[];
+    metrics?: AnalysisMetrics;
+    insights?: AnalysisInsights[];
+    quality_score?: {
+      total_score: number;
+      base_score?: number;
+      issue_penalty?: number;
+      grade?: string;
+      component_scores?: {
+        completeness?: number;
+        consistency?: number;
+        format_compliance?: number;
+      };
+    };
+    basic_metrics?: Record<string, unknown>;
+    file_structure_analysis?: Record<string, unknown>;
   };
   visualizations?: AnalysisVisualizations;
   metadata?: {
@@ -222,6 +244,9 @@ export interface FrontendAnalysisResult {
     }>;
   };
 }
+
+type DatasetInfoResponse = NonNullable<UploadResponse['dataset_info']>;
+type MetadataResponse = NonNullable<UploadResponse['metadata']>;
 
 class AnalysisAPIService {
   private baseURL: string;
@@ -433,16 +458,27 @@ class AnalysisAPIService {
         const results = await this.getAnalysisResults(analysisId);
         
         // Check if we got valid results with the required structure
-        if (results && results.results && results.results.metrics) {
+        const hasStructuredResults =
+          !!results?.results &&
+          (
+            (results.results as Record<string, unknown>)?.quality_score !== undefined ||
+            (results.results as Record<string, unknown>)?.quality_analysis !== undefined ||
+            (results.results as Record<string, unknown>)?.basic_metrics !== undefined ||
+            Array.isArray((results.results as Record<string, unknown>)?.insights)
+          );
+        const hasDatasetInfo = !!results?.dataset_info;
+        const hasFileHealth = !!results?.file_health;
+
+        if (hasStructuredResults || hasDatasetInfo || hasFileHealth) {
           console.log('✅ Analysis results retrieved successfully!');
           if (onProgress) {
             onProgress('completed', 100);
           }
           return results;
-        } else {
-          console.log('⚠️ Results received but incomplete, retrying...');
-          console.log('📋 Received results structure:', JSON.stringify(results, null, 2));
         }
+
+        console.log('⚠️ Results received but incomplete, retrying...');
+        console.log('📋 Received results structure:', JSON.stringify(results, null, 2));
 
         // Wait 5 seconds before next attempt
         await new Promise(resolve => setTimeout(resolve, 5000));
@@ -594,77 +630,126 @@ class AnalysisAPIService {
     }
     
     // Extract data from the actual API response structure with proper fallbacks
-    const metadata = backendResult.metadata || {
-      file_name: 'dataset.csv',
-      upload_date: new Date().toISOString(),
-      file_size: '0 B',
-      rows: 0,
-      columns: 0,
-      ipfs_hash: '',
-      contract_address: '',
-      block_number: '',
-      is_public: false
+    const toNumber = (value: unknown, fallback = 0): number => {
+      if (value === null || value === undefined) return fallback;
+      if (typeof value === 'number') return Number.isFinite(value) ? value : fallback;
+      if (typeof value === 'string') {
+        const parsed = parseFloat(value);
+        return Number.isFinite(parsed) ? parsed : fallback;
+      }
+      return fallback;
     };
-    
-    const results = backendResult.results || {
-      metrics: {
-        quality_score: 85,
-        completeness: 90,
-        consistency: 85,
-        accuracy: 85,
-        validity: 85,
-        anomalies: {
-          total: 0,
-          high: 0,
-          medium: 0,
-          low: 0,
-          details: []
-        },
-        bias_metrics: {
-          overall: 0.15,
-          geographic: { score: 0.1, status: 'Low', description: 'Minimal geographic bias detected' },
-          demographic: { score: 0.2, status: 'Low', description: 'Some demographic skew present' }
-        }
+
+    const metadata = (backendResult.metadata ?? {}) as Partial<MetadataResponse>;
+    const datasetInfo = (backendResult.dataset_info ?? {}) as Partial<DatasetInfoResponse>;
+    const results = (backendResult.results ?? {}) as Record<string, any>;
+    const qualityScoreRaw = (results as Record<string, any>)?.quality_score || {};
+    const qualityAnalysis = (results as Record<string, any>)?.quality_analysis || {};
+    const componentScores =
+      qualityAnalysis.component_scores ||
+      qualityScoreRaw.component_scores ||
+      {};
+    const basicMetrics = (results as Record<string, any>)?.basic_metrics || {};
+    const fileStructure = (results as Record<string, any>)?.file_structure_analysis || backendResult.file_structure_analysis;
+    const fileHealth = backendResult.file_health || {
+      structure_score: 100,
+      issues_detected: 0,
+      format_mismatch: false,
+      can_analyze: true,
+    };
+    const insightsRaw: Array<string | { title?: string; description?: string; action?: string; type?: string }> =
+      (results as Record<string, any>)?.insights || [];
+
+    const transformedInsights = insightsRaw.length > 0
+      ? insightsRaw.map((item, index) => {
+          if (typeof item === 'string') {
+            return {
+              type: 'info',
+              title: `Insight ${index + 1}`,
+              description: item,
+              action: 'Review recommendation',
+            };
+          }
+          return {
+            type: item.type || 'info',
+            title: item.title || `Insight ${index + 1}`,
+            description: item.description || 'No description provided.',
+            action: item.action || 'Review recommendation',
+          };
+        })
+      : [{
+          type: 'info',
+          title: 'Analysis Complete',
+          description: `Successfully analyzed your dataset with ${(datasetInfo.rows || metadata.rows || 0)} rows.`,
+          action: 'Review the quality scores and metrics above for detailed insights.',
+        }];
+
+    const overallQuality = toNumber(
+      qualityAnalysis.overall_score ??
+        qualityAnalysis.total_score ??
+        qualityScoreRaw.total_score ??
+        qualityScoreRaw.base_score,
+      toNumber(
+        componentScores.completeness ??
+          componentScores.consistency ??
+          componentScores.format_compliance,
+        0
+      )
+    );
+    const completenessScore = toNumber(
+      componentScores.completeness,
+      basicMetrics.missing_percentage !== undefined
+        ? Math.max(0, 100 - toNumber(basicMetrics.missing_percentage, 0))
+        : qualityScoreRaw.component_scores?.completeness
+    );
+
+    const biasRaw =
+      (results as Record<string, any>)?.bias_analysis ||
+      (results as Record<string, any>)?.bias_metrics ||
+      {};
+    const defaultBias = {
+      overall: toNumber(biasRaw?.overall, 0),
+      geographic: {
+        score: toNumber(biasRaw?.geographic?.score, 0),
+        status: biasRaw?.geographic?.status || 'Unknown',
+        description: biasRaw?.geographic?.description || 'No bias metrics available',
       },
-      insights: []
+      demographic: {
+        score: toNumber(biasRaw?.demographic?.score, 0),
+        status: biasRaw?.demographic?.status || 'Unknown',
+        description: biasRaw?.demographic?.description || 'No bias metrics available',
+      },
     };
-    
-    const metrics = results.metrics;
-    
-    console.log('📊 Extracted data:', {
-      hasMetadata: !!metadata,
-      hasResults: !!results,
-      hasMetrics: !!metrics,
-      metadataKeys: Object.keys(metadata),
-      resultsKeys: Object.keys(results),
-      metricsKeys: Object.keys(metrics)
-    });
-    
-    // Generate insights based on the actual data
-    const insights = results.insights || [{
-      type: 'info',
-      title: 'Analysis Complete',
-      description: `Successfully analyzed your dataset with ${metadata.rows || 0} rows.`,
-      action: 'Review the quality scores and metrics above for detailed insights.'
-    }];
-    
-    // Extract new enhanced API response fields
-    const dataset_info = backendResult.dataset_info;
-    const file_health = backendResult.file_health;
-    const file_structure_analysis = backendResult.file_structure_analysis;
-    
-    console.log('🔍 New API Response Fields:');
-    console.log('- dataset_info:', dataset_info);
-    console.log('- file_health:', file_health);
-    console.log('- file_structure_analysis:', file_structure_analysis);
-    
+
+    const anomaliesRaw =
+      (results as Record<string, any>)?.anomaly_detection ||
+      (results as Record<string, any>)?.anomalies ||
+      {};
+    const anomalies = {
+      total: toNumber(anomaliesRaw.total_anomalies ?? anomaliesRaw.total ?? anomaliesRaw.count, 0),
+      high: toNumber(anomaliesRaw.critical ?? anomaliesRaw.high, 0),
+      medium: toNumber(anomaliesRaw.moderate ?? anomaliesRaw.medium, 0),
+      low: toNumber(anomaliesRaw.low, 0),
+      details: anomaliesRaw.examples ?? anomaliesRaw.details ?? [],
+    };
+
+    const formatBytes = (bytes?: number): string => {
+      const value = toNumber(bytes, 0);
+      if (value === 0) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const exponent = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+      const size = value / Math.pow(1024, exponent);
+      const decimals = size >= 10 || size % 1 === 0 ? 0 : 1;
+      return `${size.toFixed(decimals)} ${units[exponent]}`;
+    };
+
     return {
       metadata: {
-        fileName: metadata.file_name || 'dataset.csv',
+        fileName: metadata.file_name || datasetInfo.original_filename || 'dataset.csv',
         uploadDate: metadata.upload_date || new Date().toISOString(),
-        fileSize: metadata.file_size || '0 B',
-        rows: metadata.rows || 0,
-        columns: metadata.columns || 0,
+        fileSize: metadata.file_size || formatBytes(datasetInfo.size_bytes),
+        rows: toNumber(datasetInfo.rows ?? metadata.rows ?? basicMetrics.total_rows, 0),
+        columns: toNumber(datasetInfo.columns ?? metadata.columns ?? basicMetrics.total_columns, 0),
         processingTime: '2-3 seconds',
         ipfsHash: metadata.ipfs_hash || '',
         contractAddress: metadata.contract_address || '',
@@ -672,29 +757,33 @@ class AnalysisAPIService {
         isPublic: metadata.is_public || false,
       },
       qualityScore: {
-        overall: metrics.quality_score || 85,
-        completeness: metrics.completeness || 90,
-        consistency: metrics.consistency || 85,
-        accuracy: metrics.accuracy || 85,
-        validity: metrics.validity || 85,
+        overall: overallQuality,
+        completeness: completenessScore,
+        consistency: toNumber(componentScores.consistency, overallQuality),
+        accuracy: toNumber(componentScores.accuracy ?? componentScores.format_compliance, overallQuality),
+        validity: toNumber(componentScores.validity ?? componentScores.format_compliance, overallQuality),
       },
-      anomalies: metrics.anomalies || {
-        total: 0,
-        high: 0,
-        medium: 0,
-        low: 0,
-        details: []
+      anomalies,
+      biasMetrics: defaultBias,
+      insights: transformedInsights,
+      dataset_info: {
+        original_filename: datasetInfo.original_filename ?? metadata.file_name ?? 'Uploaded Dataset',
+        file_type: datasetInfo.file_type || 'Unknown',
+        actual_content_type: datasetInfo.actual_content_type || 'unknown',
+        rows: toNumber(datasetInfo.rows ?? metadata.rows ?? basicMetrics.total_rows, 0),
+        columns: toNumber(datasetInfo.columns ?? metadata.columns ?? basicMetrics.total_columns, 0),
+        size_bytes: toNumber(datasetInfo.size_bytes, 0),
+        memory_usage_mb: toNumber(datasetInfo.memory_usage_mb ?? basicMetrics.memory_usage_mb, 0),
+        missing_percentage: toNumber(datasetInfo.missing_percentage ?? basicMetrics.missing_percentage, 0),
+        has_missing_values:
+          datasetInfo.has_missing_values ??
+          (toNumber(datasetInfo.missing_percentage ?? basicMetrics.missing_percentage, 0) > 0),
+        column_names: datasetInfo.column_names || [],
+        column_types: datasetInfo.column_types || {},
+        extension_mismatch: datasetInfo.extension_mismatch ?? false,
       },
-      biasMetrics: metrics.bias_metrics || {
-        overall: 0.15,
-        geographic: { score: 0.1, status: 'Low', description: 'Minimal geographic bias detected' },
-        demographic: { score: 0.2, status: 'Low', description: 'Some demographic skew present' }
-      },
-      insights: insights,
-      // Include new enhanced API response fields
-      dataset_info: dataset_info,
-      file_health: file_health,
-      file_structure_analysis: file_structure_analysis
+      file_health: fileHealth,
+      file_structure_analysis: fileStructure,
     };
   }
 

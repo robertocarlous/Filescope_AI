@@ -637,12 +637,16 @@ const ResultsPage = () => {
                   </div>
                   <div className="flex justify-between items-center">
                     <span className="text-gray-600 dark:text-gray-400">Memory Usage:</span>
-                    <span className="font-medium text-gray-900 dark:text-white">{results.dataset_info.memory_usage_mb.toFixed(2)} MB</span>
+                    <span className="font-medium text-gray-900 dark:text-white">
+                      {Number(results.dataset_info?.memory_usage_mb ?? 0).toFixed(2)} MB
+                    </span>
                   </div>
                   <div className="flex justify-between items-center">
                     <span className="text-gray-600 dark:text-gray-400">Missing Values:</span>
                     <span className="font-medium text-gray-900 dark:text-white">
-                      {results.dataset_info.has_missing_values ? `${results.dataset_info.missing_percentage.toFixed(1)}%` : 'None'}
+                      {results.dataset_info?.has_missing_values
+                        ? `${Number(results.dataset_info?.missing_percentage ?? 0).toFixed(1)}%`
+                        : 'None'}
                     </span>
                   </div>
                   {results.dataset_info.extension_mismatch && (
