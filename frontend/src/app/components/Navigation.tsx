@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { useTheme } from 'next-themes';
 import { useAccount } from 'wagmi';
 import { useRouter } from 'next/navigation';
-import { Sun, Moon, Menu, X, Database } from 'lucide-react';
+import { Sun, Moon, Menu, X, Database, HelpCircle } from 'lucide-react';
 import { ConnectWallet } from '../../components/ConnectWallet';
 import toast from 'react-hot-toast';
 
@@ -71,6 +71,13 @@ const Navigation = () => {
             >
               SDK
             </Link>
+            <Link 
+              href="/faq"
+              className="text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white transition-colors flex items-center space-x-1"
+            >
+              <HelpCircle className="w-4 h-4" />
+              <span>FAQ</span>
+            </Link>
           </div>
 
           {/* Right side - Theme toggle and Connect Wallet */}
@@ -124,6 +131,14 @@ const Navigation = () => {
                 className="text-left text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white transition-colors px-4 py-2 hover:bg-gray-50 dark:hover:bg-gray-800 rounded-lg"
               >
                 SDK
+              </Link>
+              <Link 
+                href="/faq"
+                onClick={() => setIsMenuOpen(false)}
+                className="text-left text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white transition-colors px-4 py-2 hover:bg-gray-50 dark:hover:bg-gray-800 rounded-lg flex items-center space-x-2"
+              >
+                <HelpCircle className="w-4 h-4" />
+                <span>FAQ</span>
               </Link>
             </div>
           </div>
