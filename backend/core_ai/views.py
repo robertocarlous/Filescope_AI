@@ -21,729 +21,287 @@ import json
 import logging
 
 
-from .tasks import (
-    process_dataset,
-    load_dataset,  
-    get_basic_statistics,
-    analyze_data_quality,
-    detect_anomalies,
-    analyze_bias,
-    generate_insights,
-    create_visualizations,
-    ALLOWED_EXTENSIONS,
-    MAX_FILE_SIZE
-)
-from .tasks import process_dataset
-import logging
-logger = logging.getLogger(__name__)
-
-
-ALLOWED_EXTENSIONS = {'.csv', '.json', '.xlsx', '.xls', '.parquet', '.txt', '.tsv', '.doc', '.docx'}
-MAX_FILE_SIZE = 100 * 1024 * 1024 
-
-
-
-
-# @api_view(['POST'])
-# def upload_dataset(request):
-#     """
-#     Single endpoint for upload and analysis
-    
-#     URL: POST /api/upload/
-    
-#     Query Parameters:
-#     - include_visualizations: true/false (default: false)
-#     - analysis_depth: basic/full (default: basic)
-    
-#     Form Data:
-#     - file: Dataset file (required)
-#     - name: Dataset name (optional)
-#     - description: Dataset description (optional)
-    
-#     Response:
-#     {
-#         "success": true,
-#         "analysis_id": "uuid",
-#         "status": "completed",
-#         "dataset_info": {
-#             "name": "filename.csv",
-#             "rows": 1000,
-#             "columns": 25,
-#             "size_bytes": 524288,
-#             "file_type": "csv"
-#         },
-#         "results": {
-#             "quality_score": {
-#                 "total_score": 85.5,
-#                 "grade": "B",
-#                 "component_scores": {...}
-#             },
-#             "metrics": {...},
-#             "insights": {...}
-#         },
-#         "visualizations": {
-#             "available": ["correlation_matrix", "distribution_age"],
-#             "included": false,
-#             "data": {...}  // only if include_visualizations=true
-#         }
-#     }
-#     """
-#     try:
-#         # Validate file upload
-#         if 'file' not in request.FILES:
-#             return Response({
-#                 'success': false,
-#                 'error': 'No file provided',
-#                 'error_code': 'NO_FILE'
-#             }, status=status.HTTP_400_BAD_REQUEST)
-        
-#         file = request.FILES['file']
-#         dataset_name = request.POST.get('name', file.name)
-#         dataset_description = request.POST.get('description', '')
-        
-#         # Get query parameters
-#         include_viz = request.query_params.get('include_visualizations', 'false').lower() == 'true'
-#         analysis_depth = request.query_params.get('analysis_depth', 'basic')
-        
-#         # Validate and process file
-#         try:
-#             result = process_uploaded_file(
-#                 file, 
-#                 dataset_name, 
-#                 dataset_description,
-#                 include_viz,
-#                 analysis_depth,
-#                 request.user if request.user.is_authenticated else None
-#             )
-            
-#             return Response(result, status=status.HTTP_200_OK)
-            
-#         except ValueError as e:
-#             return Response({
-#                 'success': False,
-#                 'error': str(e),
-#                 'error_code': 'VALIDATION_ERROR'
-#             }, status=status.HTTP_400_BAD_REQUEST)
-            
-#         except Exception as e:
-#             logger.error(f"Processing error: {str(e)}")
-#             return Response({
-#                 'success': False,
-#                 'error': 'Processing failed. Please try again.',
-#                 'error_code': 'PROCESSING_ERROR'
-#             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-            
-#     except Exception as e:
-#         logger.error(f"Upload error: {str(e)}")
-#         return Response({
-#             'success': False,
-#             'error': 'Upload failed. Please try again.',
-#             'error_code': 'UPLOAD_ERROR'
-#         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-# def process_uploaded_file(file, name, description, include_viz, analysis_depth, user):
-#     """
-#     Process uploaded file and return complete analysis
-#     """
-#     file_extension = os.path.splitext(file.name)[1].lower()
-#     ALLOWED_EXTENSIONS = ['.csv', '.json', '.xlsx', '.xls', '.txt', '.tsv', '.parquet']
-#     MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
-    
-#     if file_extension not in ALLOWED_EXTENSIONS:
-#         raise ValueError(f'Unsupported file type. Allowed: {", ".join(ALLOWED_EXTENSIONS)}')
-    
-#     if file.size > MAX_FILE_SIZE:
-#         raise ValueError(f'File too large. Maximum size: {MAX_FILE_SIZE//(1024*1024)}MB')
-    
-#     try:
-#         df, dataset_info = load_and_validate_dataset(file, file_extension)
-#     except Exception as e:
-#         raise ValueError(f'Invalid file content: {str(e)}')
-    
-#     file_path = default_storage.save(f'datasets/{uuid.uuid4()}_{file.name}', file)
-    
-#     from .models import DatasetAnalysis
-#     analysis = DatasetAnalysis.objects.create(
-#         user=user,
-#         dataset_file=file_path,
-#         status='processing',
-#         rows_count=dataset_info['rows'],
-#         columns_count=dataset_info['columns'],
-#         dataset_size=f"{dataset_info['size_bytes']} bytes"
-#     )
-    
-#     try:
-#         # Perform analysis
-#         results = analyze_dataset(df, dataset_info, analysis_depth)
-        
-#         # Generate visualizations if requested
-#         visualizations = {}
-#         if include_viz:
-#             visualizations = generate_visualizations(df)
-        
-#         # Update analysis record - using your actual model fields with JSON-safe types
-#         analysis.status = 'completed'
-#         analysis.quality_score = float(results['quality_score']['total_score'])
-#         analysis.rows_count = int(dataset_info['rows'])
-#         analysis.columns_count = int(dataset_info['columns'])
-#         analysis.missing_values_pct = float(dataset_info['missing_percentage'])
-#         analysis.duplicate_count = int(df.duplicated().sum())
-#         analysis.full_analysis = results  # Now all values are JSON-safe
-#         analysis.key_insights = {'insights': results.get('insights', [])}
-#         analysis.save()
-        
-#         response_data = {
-#             'success': True,
-#             'analysis_id': str(analysis.id),
-#             'status': 'completed',
-#             'dataset_info': {
-#                 'original_filename': file.name,
-#                 **dataset_info
-#             },
-#             'results': results,
-#             'visualizations': {
-#                 'available': list(visualizations.keys()),
-#                 'included': include_viz,
-#                 'count': len(visualizations)
-#             }
-#         }
-        
-#         if include_viz:
-#             response_data['visualizations']['data'] = visualizations
-        
-#         return response_data
-        
-#     except Exception as e:
-#         analysis.status = 'failed'
-#         analysis.error_message = str(e)
-#         analysis.save()
-#         raise e
-
-
-# def load_and_validate_dataset(file, file_extension):
-#     """Load dataset and extract basic information"""
-    
-#     file_size = file.size
-    
-#     if file_extension == '.csv':
-#         df = pd.read_csv(file, encoding='utf-8', low_memory=False)
-#     elif file_extension == '.tsv':
-#         df = pd.read_csv(file, sep='\t', encoding='utf-8', low_memory=False)
-#     elif file_extension == '.json':
-#         df = load_json_dataset(file)
-#     elif file_extension in ['.xlsx', '.xls']:
-#         df = pd.read_excel(file)
-#     elif file_extension == '.txt':
-#         df = load_txt_dataset(file)
-#     elif file_extension == '.parquet':
-#         df = pd.read_parquet(file)
-#     else:
-#         df = pd.read_csv(file, encoding='utf-8', low_memory=False)
-    
-#     if df.empty:
-#         raise ValueError("Dataset is empty")
-    
-#     if len(df.columns) == 0:
-#         raise ValueError("No columns found in dataset")
-    
-#     dataset_info = {
-#         'rows': int(len(df)),
-#         'columns': int(len(df.columns)),
-#         'size_bytes': int(file_size),
-#         'file_type': file_extension.lstrip('.'),
-#         'column_names': [str(col) for col in df.columns.tolist()],
-#         'column_types': {str(col): str(dtype) for col, dtype in df.dtypes.items()},
-#         'memory_usage_mb': round(float(df.memory_usage(deep=True).sum() / (1024*1024)), 2),
-#         'has_missing_values': bool(df.isnull().any().any()),
-#         'missing_percentage': round(float(df.isnull().sum().sum() / (len(df) * len(df.columns)) * 100) if len(df) > 0 and len(df.columns) > 0 else 0, 2)
-#     }
-    
-#     return df, dataset_info
-
-
-# def load_json_dataset(file):
-#     """Load JSON dataset with multiple format support"""
-#     content = file.read()
-#     if isinstance(content, bytes):
-#         content = content.decode('utf-8')
-    
-#     try:
-#         data = json.loads(content)
-        
-#         if isinstance(data, list):
-#             return pd.DataFrame(data)
-#         elif isinstance(data, dict):
-#             if 'data' in data and isinstance(data['data'], list):
-#                 return pd.DataFrame(data['data'])
-#             else:
-#                 return pd.DataFrame([data])
-#         else:
-#             raise ValueError("Unsupported JSON structure")
-#     except json.JSONDecodeError as e:
-#         raise ValueError(f"Invalid JSON format: {str(e)}")
-
-
-# def load_txt_dataset(file):
-#     """Load TXT file and attempt to detect structure"""
-#     content = file.read()
-#     if isinstance(content, bytes):
-#         content = content.decode('utf-8', errors='ignore')
-    
-#     lines = content.strip().split('\n')
-#     if not lines:
-#         raise ValueError("Empty file")
-    
-#     # Try to detect separator
-#     first_line = lines[0]
-#     separators = ['\t', ',', '|', ';']
-    
-#     best_sep = None
-#     max_cols = 0
-    
-#     for sep in separators:
-#         cols = len(first_line.split(sep))
-#         if cols > max_cols and cols > 1:
-#             max_cols = cols
-#             best_sep = sep
-    
-#     if best_sep and max_cols > 1:
-#         from io import StringIO
-#         return pd.read_csv(StringIO(content), sep=best_sep)
-#     else:
-#         return pd.DataFrame({'text': lines})
-
-
-# def analyze_dataset(df, dataset_info, depth='basic'):
-#     """Perform dataset analysis based on depth level"""
-    
-#     results = {
-#         'quality_score': calculate_quality_score(df),
-#         'basic_metrics': get_basic_metrics(df),
-#         'insights': generate_basic_insights(df, dataset_info)
-#     }
-    
-#     if depth == 'full':
-#         results.update({
-#             'detailed_statistics': get_detailed_statistics(df),
-#             'correlation_analysis': get_correlation_analysis(df),
-#             'outlier_analysis': get_outlier_analysis(df),
-#             'advanced_insights': generate_advanced_insights(df)
-#         })
-    
-#     return results
-
-
-# def calculate_quality_score(df):
-#     """
-#     Calculate comprehensive dataset quality score (0-100)
-    
-#     Scoring Breakdown:
-#     - Completeness: 40 points (missing data)
-#     - Size Adequacy: 30 points (rows + columns) 
-#     - Data Consistency: 30 points (types + naming + duplicates)
-#     """
-#     scores = {}
-    
-#     total_cells = len(df) * len(df.columns)
-#     missing_cells = int(df.isnull().sum().sum())  
-    
-#     if total_cells > 0:
-#         missing_ratio = missing_cells / total_cells
-#         completeness_score = (1 - missing_ratio) * 40
-#     else:
-#         completeness_score = 0
-    
-#     scores['completeness'] = round(float(completeness_score), 2)
-    
-#     rows, cols = len(df), len(df.columns)
-    
-#     if rows >= 1000:
-#         row_score = 20
-#     elif rows >= 500:
-#         row_score = 15
-#     elif rows >= 100:
-#         row_score = 10
-#     elif rows >= 50:
-#         row_score = 5
-#     else:
-#         row_score = 0
-    
-#     # Column adequacy (10 points max)
-#     if cols >= 10:
-#         col_score = 10
-#     elif cols >= 5:
-#         col_score = 7
-#     elif cols >= 3:
-#         col_score = 5
-#     elif cols >= 2:
-#         col_score = 3
-#     else:
-#         col_score = 0
-    
-#     size_score = row_score + col_score
-#     scores['size'] = float(size_score)
-    
-#     consistency_total = 0
-    
-#     type_consistency = 0
-#     numeric_cols = df.select_dtypes(include=[np.number]).columns
-    
-#     for col in df.columns:
-#         try:
-#             if col in numeric_cols:
-#                 if not df[col].isin([np.inf, -np.inf]).any():
-#                     type_consistency += 1
-#             else:
-#                 if df[col].dtype == 'object':
-#                     try:
-#                         numeric_vals = pd.to_numeric(df[col], errors='coerce').notna().sum()
-#                         total_vals = df[col].notna().sum()
-#                         if total_vals == 0 or numeric_vals / total_vals < 0.1 or numeric_vals / total_vals > 0.9:
-#                             type_consistency += 1
-#                     except:
-#                         type_consistency += 1
-#                 else:
-#                     type_consistency += 1
-#         except:
-#             pass
-    
-#     if len(df.columns) > 0:
-#         type_score = (type_consistency / len(df.columns)) * 15
-#     else:
-#         type_score = 0
-    
-#     consistency_total += type_score
-    
-#     naming_quality = 0
-#     total_naming_checks = 0
-    
-#     for col in df.columns:
-#         col_str = str(col)
-#         checks_passed = 0
-        
-#         if col_str.strip() == col_str:
-#             checks_passed += 1
-        
-#         problematic_chars = ['?', '#', '@', '!', '*', '&', '%']
-#         if not any(char in col_str for char in problematic_chars):
-#             checks_passed += 1
-        
-#         if not col_str.lower().startswith('unnamed'):
-#             checks_passed += 1
-        
-#         if len(col_str) > 0 and len(col_str) < 100:
-#             checks_passed += 1
-        
-#         naming_quality += checks_passed
-#         total_naming_checks += 4
-    
-#     if total_naming_checks > 0:
-#         naming_score = (naming_quality / total_naming_checks) * 10
-#     else:
-#         naming_score = 0
-    
-#     consistency_total += naming_score
-    
-#     if len(df) > 0:
-#         duplicate_count = int(df.duplicated().sum())  # Convert to Python int
-#         duplicate_ratio = duplicate_count / len(df)
-#         duplicate_score = (1 - duplicate_ratio) * 5
-#     else:
-#         duplicate_score = 0
-#         duplicate_count = 0
-    
-#     consistency_total += duplicate_score
-    
-#     scores['consistency'] = round(float(consistency_total), 2)
-#     scores['breakdown'] = {
-#         'type_consistency': round(float(type_score), 2),
-#         'naming_quality': round(float(naming_score), 2), 
-#         'duplicate_penalty': round(float(duplicate_score), 2)
-#     }
-    
-#     total_score = sum([scores['completeness'], scores['size'], scores['consistency']])
-    
-#     metrics = {
-#         'missing_percentage': round(float((missing_cells / total_cells * 100) if total_cells > 0 else 0), 2),
-#         'duplicate_percentage': round(float((duplicate_count / len(df) * 100) if len(df) > 0 else 0), 2),
-#         'columns_with_missing': [str(col) for col in df.columns[df.isnull().any()].tolist()],
-#         'row_count': int(rows),
-#         'column_count': int(cols)
-#     }
-    
-#     return {
-#         'total_score': round(float(total_score), 1),
-#         'component_scores': scores,
-#         'grade': get_grade(total_score),
-#         'detailed_metrics': metrics,
-#         'score_explanation': {
-#             'completeness_details': f"Missing {missing_cells}/{total_cells} cells ({metrics['missing_percentage']}%)",
-#             'size_details': f"{rows} rows, {cols} columns",
-#             'consistency_details': f"{metrics['duplicate_percentage']}% duplicates, type consistency check passed"
-#         }
-#     }
-
-
-# def get_grade(score):
-#     """Convert score to letter grade"""
-#     if score >= 90: return 'A'
-#     elif score >= 80: return 'B'
-#     elif score >= 70: return 'C'
-#     elif score >= 60: return 'D'
-#     else: return 'F'
-
-
-# def get_basic_metrics(df):
-#     """Get basic dataset metrics with JSON-safe types"""
-#     numeric_cols = df.select_dtypes(include=[np.number]).columns
-#     categorical_cols = df.select_dtypes(include=['object']).columns
-    
-#     # Convert all numpy types to Python native types for JSON serialization
-#     total_missing = int(df.isnull().sum().sum())
-#     duplicate_rows = int(df.duplicated().sum())
-    
-#     return {
-#         'shape': {'rows': int(len(df)), 'columns': int(len(df.columns))},
-#         'column_types': {
-#             'numeric': int(len(numeric_cols)),
-#             'categorical': int(len(categorical_cols)),
-#             'datetime': int(len(df.select_dtypes(include=['datetime']).columns))
-#         },
-#         'missing_data': {
-#             'total_missing': total_missing,
-#             'columns_with_missing': [str(col) for col in df.columns[df.isnull().any()].tolist()],
-#             'missing_percentage': round(float(total_missing / (len(df) * len(df.columns)) * 100) if len(df) > 0 and len(df.columns) > 0 else 0, 2)
-#         },
-#         'duplicates': {
-#             'duplicate_rows': duplicate_rows,
-#             'duplicate_percentage': round(float(duplicate_rows / len(df) * 100) if len(df) > 0 else 0, 2)
-#         }
-#     }
-
-
-# def generate_basic_insights(df, dataset_info):
-#     """Generate basic insights about the dataset"""
-#     insights = []
-    
-#     missing_pct = dataset_info.get('missing_percentage', 0)
-#     if missing_pct > 20:
-#         insights.append(f"High missing data ({missing_pct}%) - consider data cleaning")
-#     elif missing_pct > 5:
-#         insights.append(f"Moderate missing data ({missing_pct}%) detected")
-    
-#     if len(df) < 100:
-#         insights.append("Small dataset - results may have limited statistical power")
-#     elif len(df) > 100000:
-#         insights.append("Large dataset - consider sampling for initial exploration")
-    
-#     if len(df.columns) > 50:
-#         insights.append("High-dimensional dataset - consider feature selection")
-    
-#     duplicate_pct = (df.duplicated().sum() / len(df)) * 100
-#     if duplicate_pct > 10:
-#         insights.append(f"High duplication ({duplicate_pct:.1f}%) - consider deduplication")
-    
-#     return insights
-
-
-# def generate_visualizations(df):
-#     """Generate basic visualizations (placeholder - implement with matplotlib/plotly)"""
-#     visualizations = {}
-    
-#     numeric_cols = df.select_dtypes(include=[np.number]).columns
-#     categorical_cols = df.select_dtypes(include=['object']).columns
-    
-    
-#     for col in numeric_cols[:5]:  # First 5 numeric columns
-#         visualizations[f'distribution_{col}'] = {
-#             'type': 'histogram',
-#             'description': f'Distribution of {col}',
-#             'data': None  # Would contain actual chart data/image
-#         }
-    
-#     if len(numeric_cols) > 1:
-#         visualizations['correlation_matrix'] = {
-#             'type': 'heatmap',
-#             'description': 'Correlation matrix of numeric variables',
-#             'data': None
-#         }
-    
-#     for col in categorical_cols[:3]:  # First 3 categorical columns
-#         if df[col].nunique() <= 20:  # Only for columns with reasonable number of categories
-#             visualizations[f'bar_{col}'] = {
-#                 'type': 'bar',
-#                 'description': f'Distribution of {col}',
-#                 'data': None
-#             }
-    
-#     return visualizations
-
-import mammoth
-import json
-import pandas as pd
-import numpy as np
 import os
 import uuid
+import json
+import logging
+from io import StringIO
+from io import StringIO
+import mimetypes
+import mammoth  # pip install mammoth if missing
+
+import pandas as pd
+import numpy as np
+import requests
+from django.conf import settings
+from django.shortcuts import get_object_or_404
 from django.core.files.storage import default_storage
+from django.db.models import Q
+from django.core.paginator import Paginator
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
-import logging
-from io import StringIO
+
+from .models import DatasetAnalysis
+from .tasks import (
+    detect_anomalies,
+    analyze_bias,
+    generate_visualizations_smart,
+    generate_smart_insights,
+    get_smart_basic_metrics,
+    calculate_base_quality_score,
+    calculate_completeness_score,
+    calculate_consistency_score,
+    get_detailed_statistics,
+    analyze_content_type,
+    generate_recommendations,
+)
 
 logger = logging.getLogger(__name__)
 
-# Configuration
-ALLOWED_EXTENSIONS = {'.csv', '.json', '.xlsx', '.xls', '.parquet', '.txt', '.tsv', '.doc', '.docx'}
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+ALLOWED_EXTENSIONS = {
+    '.csv', '.json', '.xlsx', '.xls', '.parquet',
+    '.txt', '.tsv', '.doc', '.docx'
+}
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MiB
 
+
+# ----------------------------------------------------------------------
+# 1. SMART ANALYSIS (the function that was missing / broken)
+# ----------------------------------------------------------------------
+def _score_grade(score: float) -> str:
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    if score >= 70:
+        return "C"
+    if score >= 60:
+        return "D"
+    return "F"
+
+
+def analyze_dataset_smart(df: pd.DataFrame,
+                          dataset_info: dict,
+                          file_issues: list,
+                          depth: str = 'basic') -> dict:
+    """
+    Core analysis – returns a **complete** dict that is later saved into
+    `full_analysis`.  All keys that the frontend expects are present.
+    """
+    # ---------- 1. Base quality ----------
+    base_score = calculate_base_quality_score(df)
+    issue_penalty = sum(
+        10 if i['severity'] == 'high' else
+        5 if i['severity'] == 'medium' else
+        1 for i in file_issues
+    )
+    final_score = max(base_score - issue_penalty, 0)
+
+    # ---------- 2. Anomaly & Bias (imported from tasks) ----------
+    anomaly_results = detect_anomalies(df)
+    bias_results = analyze_bias(df)
+
+    # ---------- 3. Build results ----------
+    results = {
+        # ---- Quality ----
+        'quality_score': {
+            'total_score': final_score,
+            'base_score': base_score,
+            'issue_penalty': issue_penalty,
+            'grade': _score_grade(final_score),
+            'component_scores': {
+                'completeness': calculate_completeness_score(df),
+                'consistency': calculate_consistency_score(df),
+                'format_compliance': max(100 - issue_penalty, 0)
+            }
+        },
+
+        # ---- Anomaly ----
+        'anomaly_detection': {
+            'total_anomalies': anomaly_results.get('total_anomalies', 0),
+            'critical': anomaly_results.get('critical', 0),
+            'moderate': anomaly_results.get('moderate', 0),
+            'examples': anomaly_results.get('examples', [])
+        },
+
+        # ---- Bias ----
+        'bias_analysis': {
+            'overall_bias_score': bias_results.get('overall_bias_score', 100),
+            'bias_issues': bias_results.get('bias_issues', []),
+            'imbalanced_fields': bias_results.get('imbalanced_fields', {})
+        },
+
+        # ---- Basic metrics (rows, columns, missing %, etc.) ----
+        'basic_metrics': get_smart_basic_metrics(df, dataset_info),
+
+        # ---- File-structure health ----
+        'file_structure_analysis': {
+            'issues_found': len(file_issues),
+            'extension_mismatch': dataset_info.get('extension_mismatch', False),
+            'actual_content_type': dataset_info.get('actual_content_type', 'unknown'),
+            'structure_score': 100 - len([i for i in file_issues if i['severity'] in ('high', 'medium')]) * 10,
+            'issues_by_severity': {
+                'high': len([i for i in file_issues if i['severity'] == 'high']),
+                'medium': len([i for i in file_issues if i['severity'] == 'medium']),
+                'low': len([i for i in file_issues if i['severity'] == 'low']),
+                'info': len([i for i in file_issues if i['severity'] == 'info']),
+            },
+            'detailed_issues': file_issues
+        },
+
+        # ---- Insights (human-readable bullets) ----
+        'insights': generate_smart_insights(df, dataset_info, file_issues)
+    }
+
+    # ---------- 4. Full-depth extras ----------
+    if depth == 'full':
+        results.update({
+            'detailed_statistics': get_detailed_statistics(df),
+            'content_analysis': analyze_content_type(df, dataset_info),
+            'recommendations': generate_recommendations(df, dataset_info, file_issues)
+        })
+
+    return results
+
+
+# ----------------------------------------------------------------------
+# 2. UPLOAD ENDPOINT (uses the smart analyser)
+# ----------------------------------------------------------------------
 @api_view(['POST'])
 def upload_dataset(request):
     """
-    Enhanced upload endpoint that handles file format mismatches gracefully
-    
-    URL: POST /api/upload/
-    
-    Query Parameters:
-    - include_visualizations: true/false (default: false)
-    - analysis_depth: basic/full (default: basic)
-    - strict_format: true/false (default: false)
-    
-    Form Data:
-    - file: Dataset file (required)
-    - name: Dataset name (optional)
-    - description: Dataset description (optional)
+    POST /api/upload/
+    Form-data: file (required), name, description
+    Query-params:
+        include_visualizations=true|false
+        analysis_depth=basic|full
+        strict_format=true|false
     """
     try:
         if 'file' not in request.FILES:
-            return Response({
-                'success': False,
-                'error': 'No file provided',
-                'error_code': 'NO_FILE'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
+            return Response(
+                {'success': False, 'error': 'No file provided', 'error_code': 'NO_FILE'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         file = request.FILES['file']
         dataset_name = request.POST.get('name', file.name)
         dataset_description = request.POST.get('description', '')
-        
-        # Get query parameters
+
+        # ---- query params ----
         include_viz = request.query_params.get('include_visualizations', 'false').lower() == 'true'
         analysis_depth = request.query_params.get('analysis_depth', 'basic')
         strict_format = request.query_params.get('strict_format', 'false').lower() == 'true'
-        
-        try:
-            result = process_uploaded_file_smart(
-                file, 
-                dataset_name, 
-                dataset_description,
-                include_viz,
-                analysis_depth,
-                strict_format,
-                request.user if request.user.is_authenticated else None
-            )
-            
-            return Response(result, status=status.HTTP_200_OK)
-            
-        except ValueError as e:
-            return Response({
-                'success': False,
-                'error': str(e),
-                'error_code': 'VALIDATION_ERROR'
-            }, status=status.HTTP_400_BAD_REQUEST)
-            
-        except Exception as e:
-            logger.error(f"Processing error: {str(e)}")
-            return Response({
-                'success': False,
-                'error': 'Processing failed. Please try again.',
-                'error_code': 'PROCESSING_ERROR'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-            
-    except Exception as e:
-        logger.error(f"Upload error: {str(e)}")
-        return Response({
-            'success': False,
-            'error': 'Upload failed. Please try again.',
-            'error_code': 'UPLOAD_ERROR'
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        result = process_uploaded_file_smart(
+            file=file,
+            name=dataset_name,
+            description=dataset_description,
+            include_viz=include_viz,
+            analysis_depth=analysis_depth,
+            strict_format=strict_format,
+            user=request.user if request.user.is_authenticated else None
+        )
+        return Response(result, status=status.HTTP_200_OK)
+
+    except Exception as exc:
+        logger.exception("upload_dataset unexpected error")
+        return Response(
+            {'success': False, 'error': 'Upload failed', 'error_code': 'UPLOAD_ERROR'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
-def process_uploaded_file_smart(file, name, description, include_viz, analysis_depth, strict_format, user):
+def process_uploaded_file_smart(file, name, description,
+                                include_viz, analysis_depth,
+                                strict_format, user):
     """
-    Smart file processing that handles format mismatches and content detection
+    Core upload → parse → analyse → save → return JSON.
     """
-    file_extension = os.path.splitext(file.name)[1].lower()
-    
-    if file_extension not in ALLOWED_EXTENSIONS:
+    # ---- 1. Basic validation ----
+    ext = os.path.splitext(file.name)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
         raise ValueError(f'Unsupported file type. Allowed: {", ".join(ALLOWED_EXTENSIONS)}')
-    
     if file.size > MAX_FILE_SIZE:
-        raise ValueError(f'File too large. Maximum size: {MAX_FILE_SIZE//(1024*1024)}MB')
-    
-    # Smart content detection and parsing
-    df, dataset_info, file_issues = smart_file_parser(file, file_extension)
-    
-    # If strict_format is enabled, fail on major format mismatches
-    if strict_format and any(issue['severity'] == 'high' for issue in file_issues):
-        major_issues = [issue['message'] for issue in file_issues if issue['severity'] == 'high']
-        raise ValueError(f"Strict format validation failed: {'; '.join(major_issues)}")
-    
-    # Store file and create analysis record
-    file_path = default_storage.save(f'datasets/{uuid.uuid4()}_{file.name}', file)
-    
-    # Import your models here (adjust import path as needed)
-    from .models import DatasetAnalysis
-    
+        raise ValueError(f'File too large. Max {MAX_FILE_SIZE // (1024*1024)} MB')
+
+    # ---- 2. Smart parsing (your existing smart_file_parser) ----
+    df, dataset_info, file_issues = smart_file_parser(file, ext)
+
+    # ---- 3. Strict-format guard ----
+    if strict_format and any(i['severity'] == 'high' for i in file_issues):
+        msgs = [i['message'] for i in file_issues if i['severity'] == 'high']
+        raise ValueError(f"Strict validation failed: {'; '.join(msgs)}")
+
+    # ---- 4. Persist file & create DB record ----
+    stored_path = default_storage.save(f'datasets/{uuid.uuid4()}_{file.name}', file)
+
     analysis = DatasetAnalysis.objects.create(
         user=user,
-        dataset_file=file_path,
+        dataset_file=stored_path,
         status='processing',
-        rows_count=dataset_info['rows'],
-        columns_count=dataset_info['columns'],
-        dataset_size=f"{dataset_info['size_bytes']} bytes"
+        rows_count=int(dataset_info.get('rows', 0)),
+        columns_count=int(dataset_info.get('columns', 0)),
+        dataset_size=f"{dataset_info.get('size_bytes', 0)} bytes"
     )
-    
+
     try:
-        # Perform analysis with file issues context
-        results = analyze_dataset_smart(df, dataset_info, file_issues, analysis_depth)
-        
-        # Generate visualizations if requested
+        # ---- 5. Run the smart analysis ----
+        results = analyze_dataset_smart(df, dataset_info, file_issues, depth=analysis_depth)
+
+        # ---- 6. Visualisations (optional) ----
         visualizations = {}
         if include_viz:
             visualizations = generate_visualizations_smart(df, file_issues)
-        
-        # Update analysis record
+
+        # ---- 7. Populate model fields ----
         analysis.status = 'completed'
         analysis.quality_score = float(results['quality_score']['total_score'])
-        analysis.rows_count = int(dataset_info['rows'])
-        analysis.columns_count = int(dataset_info['columns'])
         analysis.missing_values_pct = float(dataset_info.get('missing_percentage', 0))
         analysis.duplicate_count = int(df.duplicated().sum())
+
+        # Anomaly fields
+        analysis.anomaly_count = results['anomaly_detection']['total_anomalies']
+        analysis.critical_anomalies = results['anomaly_detection']['critical']
+        analysis.moderate_anomalies = results['anomaly_detection']['moderate']
+        analysis.anomaly_examples = results['anomaly_detection']['examples']
+
+        # Bias field
+        analysis.bias_score = float(results['bias_analysis']['overall_bias_score'])
+
+        # Full JSON bundle (includes dataset_info for later GET)
+        results['dataset_info'] = {
+            'original_filename': file.name,
+            **dataset_info
+        }
         analysis.full_analysis = results
-        
-        # Include file issues in insights
+
+        # Human-readable insights
         all_insights = results.get('insights', [])
         if file_issues:
-            issue_insights = [f"📁 {issue['message']}" for issue in file_issues if issue['severity'] in ['high', 'medium']]
+            issue_insights = [
+                f"{i['message']}"
+                for i in file_issues
+                if i['severity'] in ('high', 'medium')
+            ]
             all_insights = issue_insights + all_insights
-        
         analysis.key_insights = {'insights': all_insights}
+        analysis.visualization_data = visualizations
+
         analysis.save()
-        
-        response_data = {
+
+        # ---- 8. Build response ----
+        resp = {
             'success': True,
             'analysis_id': str(analysis.id),
             'status': 'completed',
-            'dataset_info': {
-                'original_filename': file.name,
-                **dataset_info
-            },
+            'dataset_info': results['dataset_info'],
             'results': results,
             'file_health': {
-                'structure_score': 100 - len([i for i in file_issues if i['severity'] in ['high', 'medium']]) * 10,
+                'structure_score': results['file_structure_analysis']['structure_score'],
                 'issues_detected': len(file_issues),
-                'format_mismatch': any(issue['type'] == 'extension_mismatch' for issue in file_issues),
+                'format_mismatch': dataset_info.get('extension_mismatch', False),
                 'can_analyze': True
             },
             'visualizations': {
@@ -752,22 +310,29 @@ def process_uploaded_file_smart(file, name, description, include_viz, analysis_d
                 'count': len(visualizations) if visualizations else 0
             }
         }
-        
         if include_viz:
-            response_data['visualizations']['data'] = visualizations
-        
-        return response_data
-        
-    except Exception as e:
-        analysis.status = 'failed'
-        analysis.error_message = str(e)
-        analysis.save()
-        raise e
+            resp['visualizations']['data'] = visualizations
 
+        return resp
+
+    except Exception as exc:
+        analysis.status = 'failed'
+        analysis.error_message = str(exc)
+        analysis.save()
+        raise
+
+
+
+# Add this to views.py (after the imports, before upload_dataset)
+import json
+from io import StringIO
+import mimetypes
+import mammoth  # pip install mammoth if missing
 
 def smart_file_parser(file, declared_extension):
     """
-    Smart parser that detects actual content type and handles mismatches
+    Returns (df: pd.DataFrame, dataset_info: dict, file_issues: list[dict])
+    Handles .txt as CSV/TSV/document with mismatch detection.
     """
     file.seek(0)
     file_content = file.read()
@@ -785,152 +350,85 @@ def smart_file_parser(file, declared_extension):
     file_issues = []
     df = None
     actual_content_type = None
+    dataset_info = {'rows': 0, 'columns': 0, 'size_bytes': len(content_str)}
     
-    # 1. Try JSON parsing first (handles package.json as CSV case)
+    # 1. Try JSON (handles config files)
     if content_preview.startswith(('{', '[')):
         try:
             data = json.loads(content_str)
             actual_content_type = 'json'
-            
             if declared_extension != '.json':
                 file_issues.append({
-                    'type': 'extension_mismatch',
-                    'severity': 'medium',
+                    'type': 'extension_mismatch', 'severity': 'medium',
                     'message': f'File contains JSON but has {declared_extension} extension',
-                    'recommendation': f'Consider renaming to .json'
+                    'recommendation': 'Consider renaming to .json'
                 })
-            
-            # Handle different JSON structures
             if isinstance(data, dict):
-                if 'name' in data and 'version' in data:
-                    # Package.json or similar config
-                    file_issues.append({
-                        'type': 'config_file_detected',
-                        'severity': 'info',
-                        'message': 'Configuration file (package.json style) detected',
-                        'recommendation': 'Data will be flattened for analysis'
-                    })
-                    df = pd.DataFrame([flatten_json_object(data)])
-                else:
-                    # Regular JSON object
-                    df = pd.DataFrame([data])
+                df = pd.DataFrame([data])
             elif isinstance(data, list) and data:
-                if isinstance(data[0], dict):
-                    df = pd.DataFrame(data)
-                else:
-                    df = pd.DataFrame({'items': data})
+                df = pd.DataFrame(data)
             else:
                 df = pd.DataFrame({'value': [data]})
-                
+            dataset_info['actual_content_type'] = actual_content_type
+            dataset_info['rows'] = len(df)
+            dataset_info['columns'] = len(df.columns)
+            dataset_info['extension_mismatch'] = declared_extension != '.json'
+            return df, dataset_info, file_issues
         except json.JSONDecodeError:
             pass
     
-    # 2. Try CSV parsing (handles CSV as JSON case)
-    if df is None:
+    # 2. Try CSV/TSV for .txt (smart detection via commas/tabs)
+    lines = content_preview.split('\n')[:10]
+    comma_counts = [line.count(',') for line in lines if line.strip()]
+    tab_counts = [line.count('\t') for line in lines if line.strip()]
+    
+    if max(comma_counts) >= 1 or declared_extension == '.csv':
         try:
-            # Quick CSV detection
-            lines = content_preview.split('\n')[:10]
-            comma_counts = [line.count(',') for line in lines if line.strip()]
-            
-            if comma_counts and max(comma_counts) >= 1:
-                df = pd.read_csv(StringIO(content_str))
-                actual_content_type = 'csv'
-                
-                if declared_extension != '.csv':
-                    file_issues.append({
-                        'type': 'extension_mismatch',
-                        'severity': 'medium',
-                        'message': f'File contains CSV data but has {declared_extension} extension',
-                        'recommendation': 'Consider renaming to .csv'
-                    })
-                
-                # Check for analysis report format
-                if len(df) > 0 and any('Analysis Report' in str(cell) for cell in df.iloc[:3, :].values.flatten()):
-                    file_issues.append({
-                        'type': 'report_format',
-                        'severity': 'info',
-                        'message': 'Analysis report format detected',
-                        'recommendation': 'Will extract structured data from report'
-                    })
-                    df = parse_analysis_report(content_str)
-                    
-        except Exception as parse_error:
-            logger.debug(f"CSV parsing failed: {parse_error}")
+            df = pd.read_csv(StringIO(content_str))
+            actual_content_type = 'csv'
+            if declared_extension != '.csv':
+                file_issues.append({
+                    'type': 'extension_mismatch', 'severity': 'medium',
+                    'message': f'File contains CSV data but has {declared_extension} extension',
+                    'recommendation': 'Consider renaming to .csv'
+                })
+            dataset_info['actual_content_type'] = actual_content_type
+            dataset_info['rows'] = len(df)
+            dataset_info['columns'] = len(df.columns)
+            dataset_info['extension_mismatch'] = True
+            dataset_info['missing_percentage'] = round(df.isna().mean().mean() * 100, 2)
+            return df, dataset_info, file_issues
+        except Exception as e:
+            file_issues.append({'type': 'csv_parse_fail', 'severity': 'high', 'message': f'CSV parsing failed: {str(e)}'})
     
-    # 3. Try Excel formats
-    if df is None and declared_extension in ['.xlsx', '.xls']:
+    if max(tab_counts) >= 1:
         try:
-            df = pd.read_excel(file)
-            actual_content_type = 'excel'
-        except Exception as excel_error:
-            logger.debug(f"Excel parsing failed: {excel_error}")
+            df = pd.read_csv(StringIO(content_str), sep='\t')
+            actual_content_type = 'tsv'
+            dataset_info['actual_content_type'] = actual_content_type
+            dataset_info['rows'] = len(df)
+            dataset_info['columns'] = len(df.columns)
+            return df, dataset_info, file_issues
+        except Exception:
+            pass
     
-    # 4. Try document formats
-    if df is None and declared_extension in ['.doc', '.docx']:
-        try:
-            if declared_extension == '.docx':
-                with file.open('rb') as doc_file:
-                    result = mammoth.extract_raw_text(doc_file)
-                    text_lines = result.value.split('\n')
-            else:
-                # Basic .doc handling (would need python-docx2txt or similar for full support)
-                text_lines = content_str.split('\n')
-            
-            df = pd.DataFrame({
-                'line_number': range(1, len(text_lines) + 1),
-                'content': text_lines,
-                'char_count': [len(line) for line in text_lines]
-            })
-            actual_content_type = 'document'
-            
-            file_issues.append({
-                'type': 'document_parsed',
-                'severity': 'info',
-                'message': 'Document converted to line-by-line analysis format',
-                'recommendation': 'Text content extracted for analysis'
-            })
-            
-        except Exception as doc_error:
-            logger.debug(f"Document parsing failed: {doc_error}")
-    
-    # 5. Fallback to text analysis
-    if df is None:
-        lines = content_str.split('\n')[:1000]  # Limit to first 1000 lines
-        df = pd.DataFrame({
-            'line_number': range(1, len(lines) + 1),
-            'content': lines,
-            'char_count': [len(line) for line in lines],
-            'is_empty': [line.strip() == '' for line in lines]
-        })
-        actual_content_type = 'text'
-        
-        file_issues.append({
-            'type': 'fallback_parsing',
-            'severity': 'medium',
-            'message': 'Could not detect specific format, parsed as text',
-            'recommendation': 'Verify file format and content'
-        })
-    
-    if df is None or df.empty:
-        raise ValueError("Unable to extract any data from the file")
-    
-    # Create dataset info
-    dataset_info = {
-        'rows': len(df),
-        'columns': len(df.columns),
-        'size_bytes': file.size,
-        'file_type': declared_extension.lstrip('.'),
-        'actual_content_type': actual_content_type,
-        'extension_mismatch': actual_content_type != declared_extension.lstrip('.'),
-        'column_names': df.columns.tolist(),
-        'column_types': {col: str(dtype) for col, dtype in df.dtypes.items()},
-        'memory_usage_mb': round(df.memory_usage(deep=True).sum() / (1024*1024), 2),
-        'has_missing_values': df.isnull().any().any(),
-        'missing_percentage': round(df.isnull().sum().sum() / (len(df) * len(df.columns)) * 100, 2) if len(df) > 0 and len(df.columns) > 0 else 0
-    }
-    
+    # 3. Fallback: Document mode for .txt (line-by-line)
+    lines = content_str.split('\n')
+    df = pd.DataFrame({
+        'line_number': range(1, len(lines) + 1),
+        'content': [line.strip() for line in lines],
+        'char_count': [len(line) for line in lines]
+    })
+    actual_content_type = 'document'
+    file_issues.append({
+        'type': 'document_parsed', 'severity': 'info',
+        'message': 'Text file converted to line-by-line analysis format',
+        'recommendation': 'Text content extracted for analysis'
+    })
+    dataset_info['actual_content_type'] = actual_content_type
+    dataset_info['rows'] = len(df)
+    dataset_info['columns'] = len(df.columns)
     return df, dataset_info, file_issues
-
 
 def flatten_json_object(obj, prefix=''):
     """
@@ -944,7 +442,7 @@ def flatten_json_object(obj, prefix=''):
         if isinstance(value, dict):
             # Count nested items and flatten important ones
             flattened[f"{full_key}_count"] = len(value)
-            if len(value) <= 10:  # Only flatten small objects
+            if len(value) <= 10:
                 nested = flatten_json_object(value, f"{full_key}_")
                 flattened.update(nested)
             else:
@@ -990,7 +488,7 @@ def parse_analysis_report(content_str):
         
         # Parse data rows
         if ',' in line:
-            parts = [p.strip().strip('"') for p in line.split(',', 1)]  # Split on first comma only
+            parts = [p.strip().strip('"') for p in line.split(',', 1)]
             if len(parts) >= 2 and parts[0] and parts[1]:
                 parsed_data['section'].append(current_section)
                 parsed_data['metric'].append(parts[0])
@@ -1009,7 +507,15 @@ def parse_analysis_report(content_str):
 def analyze_dataset_smart(df, dataset_info, file_issues, depth='basic'):
     """
     Smart analysis that adapts to different content types and file issues
+    FIXED: Now includes anomaly detection and bias analysis
     """
+    # CRITICAL FIX: Import and call the analysis functions
+    from .tasks import detect_anomalies, analyze_bias
+    
+    # Perform anomaly detection and bias analysis
+    anomaly_results = detect_anomalies(df)
+    bias_results = analyze_bias(df)
+    
     # Calculate quality score with file issue penalties
     base_score = calculate_base_quality_score(df)
     issue_penalty = sum(10 if issue['severity'] == 'high' else 5 if issue['severity'] == 'medium' else 1 
@@ -1028,11 +534,25 @@ def analyze_dataset_smart(df, dataset_info, file_issues, depth='basic'):
                 'format_compliance': max(100 - issue_penalty, 0)
             }
         },
+        # CRITICAL FIX: Add anomaly detection results
+        'anomaly_detection': {
+            'total_anomalies': anomaly_results.get('total_anomalies', 0),
+            'critical': anomaly_results.get('critical', 0),
+            'moderate': anomaly_results.get('moderate', 0),
+            'examples': anomaly_results.get('examples', [])
+        },
+        # CRITICAL FIX: Add bias analysis results
+        'bias_analysis': {
+            'overall_bias_score': bias_results.get('overall_bias_score', 100),
+            'bias_issues': bias_results.get('bias_issues', []),
+            'imbalanced_fields': bias_results.get('imbalanced_fields', {})
+        },
         'basic_metrics': get_smart_basic_metrics(df, dataset_info),
         'file_structure_analysis': {
             'issues_found': len(file_issues),
             'extension_mismatch': dataset_info.get('extension_mismatch', False),
             'actual_content_type': dataset_info.get('actual_content_type', 'unknown'),
+            'structure_score': 100 - len([i for i in file_issues if i['severity'] in ['high', 'medium']]) * 10,
             'issues_by_severity': {
                 'high': len([i for i in file_issues if i['severity'] == 'high']),
                 'medium': len([i for i in file_issues if i['severity'] == 'medium']),
@@ -1147,7 +667,6 @@ def analyze_content_type(df, dataset_info):
     }
     
     if content_type == 'json':
-        # JSON-specific analysis
         if 'name' in df.columns and 'version' in df.columns:
             analysis['structure_analysis'] = {
                 'type': 'configuration_file',
@@ -1161,7 +680,6 @@ def analyze_content_type(df, dataset_info):
             }
     
     elif content_type == 'document':
-        # Document analysis
         if 'content' in df.columns:
             analysis['structure_analysis'] = {
                 'type': 'text_document',
@@ -1171,7 +689,6 @@ def analyze_content_type(df, dataset_info):
             }
     
     elif content_type == 'csv':
-        # CSV analysis
         analysis['structure_analysis'] = {
             'type': 'tabular_data',
             'well_formed': not any('Unnamed:' in str(col) for col in df.columns),
@@ -1276,7 +793,7 @@ def generate_visualizations_smart(df, file_issues):
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     if len(numeric_cols) > 0:
         # Distribution plots for numeric columns
-        for col in numeric_cols[:3]:  # Limit to first 3
+        for col in numeric_cols[:3]:
             visualizations[f'dist_{col}'] = {
                 'type': 'histogram',
                 'title': f'Distribution of {col}',
@@ -1306,7 +823,6 @@ def generate_visualizations_smart(df, file_issues):
 def get_detailed_statistics(df):
     """Get detailed statistical analysis"""
     stats = {}
-    
     # Numeric column statistics
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     if len(numeric_cols) > 0:
