@@ -13,6 +13,7 @@ import { analysisAPI } from '../../services/analysisApi';
 import { fileStoreContract } from '../index';
 import { FilecoinCloudService, getFilecoinCloudService } from '../../services/filecoinCloud';
 import { PaymentSetupModal } from '../../components/PaymentSetupModal';
+import { getIndexedDBService } from '../../services/indexedDB';
 
 // Pinata IPFS configuration
 const PINATA_API_KEY = process.env.NEXT_PUBLIC_PINATA_API_KEY;
@@ -70,6 +71,8 @@ const FileScopeApp = () => {
   const [focService, setFocService] = useState<FilecoinCloudService | null>(null);
   const [showPaymentSetup, setShowPaymentSetup] = useState(false);
   const [isCheckingPayment, setIsCheckingPayment] = useState(false);
+  const [currentProcessingStep, setCurrentProcessingStep] = useState<string>('');
+  const [pendingAnalysisId, setPendingAnalysisId] = useState<string | null>(null);
 
   // Wallet connection check
   const { isConnected, address } = useAccount();
@@ -113,9 +116,16 @@ const FileScopeApp = () => {
 
   // ALL useCallback functions MUST be called before any conditional logic
   // Function to clear saved state
-  const clearSavedState = useCallback(() => {
+  const clearSavedState = useCallback(async () => {
     sessionStorage.removeItem('uploadState');
-    console.log('🗑️ Cleared saved state');
+    try {
+      const dbService = getIndexedDBService();
+      await dbService.deleteFile();
+      console.log('🗑️ Cleared saved state and IndexedDB');
+    } catch (error) {
+      console.error('⚠️ Failed to clear IndexedDB:', error);
+      // Continue anyway
+    }
   }, []);
 
   // Function to save current state to sessionStorage
@@ -218,7 +228,7 @@ const FileScopeApp = () => {
     }
   }, [resetContract]);
 
-  const resetUpload = useCallback(() => {
+  const resetUpload = useCallback(async () => {
     setUploadedFile(null);
     setFilePreview(null);
     setError(null);
@@ -229,6 +239,15 @@ const FileScopeApp = () => {
     setAnalysisResults(null);
     setIpfsHash(null);
     resetContract();
+    
+    // Clear IndexedDB
+    try {
+      const dbService = getIndexedDBService();
+      await dbService.deleteFile();
+      console.log('🗑️ Cleared IndexedDB on reset');
+    } catch (error) {
+      console.error('⚠️ Failed to clear IndexedDB:', error);
+    }
   }, [resetContract]);
 
   // File Upload Functions
@@ -254,7 +273,7 @@ const FileScopeApp = () => {
     reader.readAsText(file);
   }, []);
 
-  const handleFileUpload = useCallback((file: File) => {
+  const handleFileUpload = useCallback(async (file: File) => {
     setError(null);
     
     if (!supportedTypes[file.type]) {
@@ -269,6 +288,16 @@ const FileScopeApp = () => {
       setError(errorMsg);
       toast.error(errorMsg);
       return;
+    }
+
+    // Store file in IndexedDB for persistence
+    try {
+      const dbService = getIndexedDBService();
+      await dbService.storeFile(file);
+      console.log('✅ File stored in IndexedDB');
+    } catch (error) {
+      console.error('⚠️ Failed to store file in IndexedDB:', error);
+      // Continue anyway - IndexedDB is optional for persistence
     }
 
     setUploadedFile(file);
@@ -336,99 +365,52 @@ const FileScopeApp = () => {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   }, []);
 
-  const startAnalysis = useCallback(async () => {
-    if (!uploadedFile) {
-      toast.error('No file selected');
-      return;
-    }
-
-    // Reset previous state
-    setAnalysisResults(null);
-    setIpfsHash(null);
-    resetContract();
-    
-    setCurrentStep('processing');
-    setIsAnalyzing(true);
-    setAnalysisProgress(0);
-    
-    // Save state before starting analysis
-    saveState();
-    
-    try {
-      // Step 1: Upload file and start real AI analysis
-      toast.loading('Uploading file and starting AI analysis...', { id: 'analysis' });
-      
-      const uploadResult = await analysisAPI.uploadAndAnalyze(uploadedFile, isPublic);
-      const analysisId = uploadResult.analysis_id;
-      setCurrentAnalysisId(typeof analysisId === 'string' ? parseInt(analysisId) : analysisId);
-      
-      toast.success(`Analysis started! ID: ${analysisId}`, { id: 'analysis' });
-      
-      // Continue with monitoring
-      await continueAnalysisMonitoring(String(analysisId));
-      
-    } catch (error) {
-      console.error('Analysis failed:', error);
-      let errorMessage = 'Analysis failed. Please try again.';
-      
-      if (error instanceof Error) {
-        console.log('🔍 Detailed error information:');
-        console.log('- Error name:', error.name);
-        console.log('- Error message:', error.message);
-        console.log('- Error stack:', error.stack);
-        
-        if (error.message.includes('No file provided')) {
-          errorMessage = 'Please select a valid file to analyze.';
-        } else if (error.message.includes('timeout')) {
-          errorMessage = 'Analysis is taking longer than expected. Please check back later.';
-        } else if (error.message.includes('IPFS')) {
-          errorMessage = 'Failed to store results on IPFS. Please try again.';
-        } else if (error.message.includes('Blockchain') || error.message.includes('Contract')) {
-          errorMessage = 'Blockchain registration failed. Please check your wallet and try again.';
-        } else if (error.message.includes('failed')) {
-          const match = error.message.match(/Upload failed \((\d+)\): (.+)/);
-          if (match) {
-            const statusCode = match[1];
-            const serverError = match[2];
-            errorMessage = `Server error (${statusCode}): ${serverError}`;
-          } else {
-            errorMessage = `Server error: ${error.message}`;
-          }
-        } else {
-          errorMessage = error.message;
-        }
-      }
-      
-      toast.error(errorMessage, { id: 'analysis' });
-      setCurrentStep('preview');
-      setIsAnalyzing(false);
-      clearSavedState(); // Clear saved state on error
-    }
-  }, [uploadedFile, isPublic, saveState, clearSavedState, resetContract]);
-
   // Function to continue monitoring analysis (used for both new and restored sessions)
   const continueAnalysisMonitoring = useCallback(async (analysisId: string) => {
     try {
-      // Step 2: Wait for analysis completion with real progress updates
-      toast.loading('AI analysis in progress...', { id: 'analysis' });
+      // Check if we already have results in state (from restoration)
+      let completedAnalysis;
+      let frontendResults;
       
-      const completedAnalysis = await analysisAPI.waitForAnalysisCompletion(
-        analysisId,
-        (status, progress) => {
-          setAnalysisProgress(progress || 0);
-          if (status === 'processing') {
-            toast.loading(`AI analysis in progress... ${Math.round(progress || 0)}%`, { id: 'analysis' });
-          } else if (status === 'pending') {
-            toast.loading('Analysis queued...', { id: 'analysis' });
+      if (analysisResults) {
+        // We already have results, skip analysis waiting
+        console.log('✅ Using existing analysis results, skipping wait');
+        frontendResults = analysisResults;
+        setCurrentProcessingStep('Processing analysis results...');
+        setAnalysisProgress(70);
+      } else {
+        // Step 2: Wait for analysis completion with real progress updates
+        setCurrentProcessingStep('Running AI analysis...');
+        setAnalysisProgress(10);
+        toast.loading('AI analysis in progress...', { id: 'analysis' });
+        saveState();
+        
+        completedAnalysis = await analysisAPI.waitForAnalysisCompletion(
+          analysisId,
+          (status, progress) => {
+            // Map backend progress (0-100) to our progress range (10-70)
+            const mappedProgress = 10 + (progress || 0) * 0.6;
+            setAnalysisProgress(mappedProgress);
+            setCurrentProcessingStep(`Analyzing dataset... ${Math.round(progress || 0)}%`);
+            saveState(); // Save progress
+            if (status === 'processing') {
+              toast.loading(`AI analysis in progress... ${Math.round(progress || 0)}%`, { id: 'analysis' });
+            } else if (status === 'pending') {
+              toast.loading('Analysis queued...', { id: 'analysis' });
+            }
           }
-        }
-      );
-      
-      // Step 3: Convert backend format to frontend format
-      const frontendResults = analysisAPI.convertToFrontendFormat(completedAnalysis);
+        );
+        
+        // Step 3: Convert backend format to frontend format
+        setCurrentProcessingStep('Processing analysis results...');
+        setAnalysisProgress(70);
+        frontendResults = analysisAPI.convertToFrontendFormat(completedAnalysis);
+      }
       
       // Log the full backend response to see what we're getting
-      console.log('🔍 Full Backend API Response:', completedAnalysis);
+      if (completedAnalysis) {
+        console.log('🔍 Full Backend API Response:', completedAnalysis);
+      }
       console.log('📊 Converted Frontend Results:', frontendResults);
       
       setAnalysisResults(frontendResults); // Store results in state
@@ -442,25 +424,56 @@ const FileScopeApp = () => {
           throw new Error('FOC service not initialized');
         }
 
-        // Check payment setup
-        setIsCheckingPayment(true);
-        const paymentStatus = await focService.checkPaymentSetup();
-        setIsCheckingPayment(false);
-
-        if (paymentStatus.needsApproval || paymentStatus.needsDeposit) {
-          // Show payment setup modal
-          setShowPaymentSetup(true);
-          throw new Error('Payment setup required for paid datasets');
+        // Validate file before upload - ensure it's a real file, not a mock from state restoration
+        if (!uploadedFile) {
+          throw new Error('File not found. The file may have been lost. Please upload your file again.');
+        }
+        
+        // Check if file is a mock file (created from sessionStorage restoration)
+        // Mock files have size 0 and no actual content - they cannot be used for FOC upload
+        if (uploadedFile.size === 0) {
+          console.error('❌ File validation failed: File size is 0. This is likely a mock file from state restoration.');
+          throw new Error('File appears to be empty or lost. Please refresh the page and upload your file again. Note: If you refreshed the page, you will need to re-upload your file as File objects cannot be restored from browser storage.');
         }
 
+        setCurrentProcessingStep('Uploading to Filecoin Onchain Cloud...');
+        setAnalysisProgress(75);
         toast.loading('Uploading to Filecoin Onchain Cloud...', { id: 'analysis' });
-        setAnalysisProgress(85);
         saveState();
 
-        // Upload to FOC
-        const focResult = await focService.uploadDataset(uploadedFile!, {
+        // Try to retrieve file from IndexedDB if current file is empty/mock
+        let fileToUpload = uploadedFile;
+        if (!uploadedFile || uploadedFile.size === 0) {
+          console.log('⚠️ File is empty or missing, attempting to retrieve from IndexedDB...');
+          const dbService = getIndexedDBService();
+          const storedFile = await dbService.getFile();
+          
+          if (storedFile && storedFile.size > 0) {
+            console.log('✅ Retrieved file from IndexedDB:', storedFile.name, `(${(storedFile.size / 1024 / 1024).toFixed(2)} MB)`);
+            fileToUpload = storedFile;
+            setUploadedFile(storedFile);
+          } else {
+            throw new Error('File not found. Please upload your file again.');
+          }
+        }
+
+        // Upload to FOC - ensure file is properly passed
+        console.log('📤 Uploading file to FOC:', {
+          name: fileToUpload.name,
+          size: fileToUpload.size,
+          sizeMB: (fileToUpload.size / 1024 / 1024).toFixed(2),
+          type: fileToUpload.type,
+          lastModified: fileToUpload.lastModified
+        });
+
+        // Verify file is still accessible
+        if (!fileToUpload.size || fileToUpload.size === 0) {
+          throw new Error('File appears to be empty. Please try uploading again.');
+        }
+
+        const focResult = await focService.uploadDataset(fileToUpload, {
           app: 'filescope-ai',
-          datasetName: uploadedFile!.name,
+          datasetName: fileToUpload.name,
           uploadedBy: address || '',
           isPaid: 'true',
           priceInFIL: priceInFIL,
@@ -468,27 +481,62 @@ const FileScopeApp = () => {
         
         datasetCID = focResult.pieceCid;
         setFocPieceCid(focResult.pieceCid);
+        setAnalysisProgress(80);
         toast.success('Dataset uploaded to FOC!', { id: 'analysis' });
       } else {
         // Free dataset: Upload to IPFS
+        setCurrentProcessingStep('Uploading to IPFS...');
+        setAnalysisProgress(75);
         toast.loading('Storing results on IPFS...', { id: 'analysis' });
-        setAnalysisProgress(85);
         saveState();
         
-        datasetCID = await uploadToIPFS(uploadedFile!, frontendResults);
+        // Try to retrieve file from IndexedDB if current file is empty/mock
+        let fileToUpload = uploadedFile;
+        if (!uploadedFile || uploadedFile.size === 0) {
+          console.log('⚠️ File is empty or missing, attempting to retrieve from IndexedDB...');
+          const dbService = getIndexedDBService();
+          const storedFile = await dbService.getFile();
+          
+          if (storedFile && storedFile.size > 0) {
+            console.log('✅ Retrieved file from IndexedDB for IPFS upload:', storedFile.name);
+            fileToUpload = storedFile;
+            setUploadedFile(storedFile);
+          } else {
+            throw new Error('File not found. Please upload your file again.');
+          }
+        }
+        
+        datasetCID = await uploadToIPFS(fileToUpload!, frontendResults);
         setIpfsHash(datasetCID);
+        setAnalysisProgress(80);
       }
 
       // Step 5: Upload analysis results to IPFS (always)
+      setCurrentProcessingStep('Storing analysis results...');
+      setAnalysisProgress(85);
       toast.loading('Storing analysis results on IPFS...', { id: 'analysis' });
-      setAnalysisProgress(90);
       saveState();
       
-      const analysisCID = await uploadToIPFS(uploadedFile!, frontendResults);
+      // Use the same file we used for dataset upload (either from state or IndexedDB)
+      let fileForAnalysis = uploadedFile;
+      if (!fileForAnalysis || fileForAnalysis.size === 0) {
+        const dbService = getIndexedDBService();
+        const storedFile = await dbService.getFile();
+        if (storedFile && storedFile.size > 0) {
+          fileForAnalysis = storedFile;
+        }
+      }
+      
+      if (!fileForAnalysis || fileForAnalysis.size === 0) {
+        throw new Error('File not available for analysis upload. Please try again.');
+      }
+      
+      const analysisCID = await uploadToIPFS(fileForAnalysis, frontendResults);
       
       // Step 6: Register on Blockchain
+      setCurrentProcessingStep('Registering on blockchain...');
+      setAnalysisProgress(90);
       toast.loading('Registering on blockchain...', { id: 'analysis' });
-      setAnalysisProgress(95);
       saveState();
       
       if (!writeContract) {
@@ -529,6 +577,8 @@ const FileScopeApp = () => {
         ],
       });
       
+      setCurrentProcessingStep('Waiting for transaction confirmation...');
+      setAnalysisProgress(95);
       console.log('✅ Smart contract call initiated...');
       toast.loading('Waiting for wallet confirmation...', { id: 'analysis' });
       
@@ -538,26 +588,144 @@ const FileScopeApp = () => {
       console.error('Analysis monitoring failed:', error);
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       
-      // Don't show error toast if it's just payment setup required
-      if (!errorMessage.includes('Payment setup required')) {
-        toast.error(`Analysis monitoring failed: ${errorMessage}`, { id: 'analysis' });
-      }
-      
-      // Only reset if it's not a payment setup error
-      if (!errorMessage.includes('Payment setup required')) {
-        setCurrentStep('preview');
-        setIsAnalyzing(false);
-        clearSavedState();
-      }
+      toast.error(`Analysis monitoring failed: ${errorMessage}`, { id: 'analysis' });
+      setCurrentStep('preview');
+      setIsAnalyzing(false);
+      setCurrentProcessingStep('');
+      clearSavedState();
     }
   }, [uploadedFile, isPublic, isPaid, priceInFIL, address, focService, uploadToIPFS, writeContract, isConnected, saveState, clearSavedState]);
+
+  const startAnalysis = useCallback(async () => {
+    if (!uploadedFile) {
+      toast.error('No file selected');
+      return;
+    }
+
+    // Clear any existing saved state to prevent restoration from interfering
+    clearSavedState();
+    sessionStorage.removeItem('analysisResults');
+    
+    // Reset previous state
+    setAnalysisResults(null);
+    setIpfsHash(null);
+    setFocPieceCid(null);
+    resetContract();
+    
+    // Set processing step FIRST to ensure UI is visible
+    console.log('🚀 Starting analysis - setting step to processing');
+    setCurrentStep('processing');
+    setIsAnalyzing(true);
+    setAnalysisProgress(0);
+    
+    // Set initial step based on whether it's a paid dataset
+    if (isPaid && priceInFIL && parseFloat(priceInFIL) > 0) {
+      setCurrentProcessingStep('Checking payment setup...');
+    } else {
+      setCurrentProcessingStep('Preparing upload...');
+    }
+    
+    console.log('✅ Step set to processing, isAnalyzing:', true, 'currentStep should be:', 'processing');
+    
+    // Force a re-render to ensure UI updates
+    await new Promise(resolve => setTimeout(resolve, 50));
+    
+    // Save state after UI has updated
+    saveState();
+    
+    // Small delay to ensure UI updates before starting async operations
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    console.log('📊 About to start analysis flow...');
+    
+    try {
+      // Step 0: Check payment setup for paid datasets BEFORE starting analysis
+      if (isPaid && priceInFIL && parseFloat(priceInFIL) > 0) {
+        if (!focService) {
+          throw new Error('FOC service not initialized. Please refresh the page.');
+        }
+
+        setCurrentProcessingStep('Checking payment setup...');
+        setAnalysisProgress(2);
+        setIsCheckingPayment(true);
+        const paymentStatus = await focService.checkPaymentSetup();
+        setIsCheckingPayment(false);
+
+        if (paymentStatus.needsApproval || paymentStatus.needsDeposit) {
+          // Clear any existing analysis ID since we haven't started analysis yet
+          setCurrentAnalysisId(null);
+          setPendingAnalysisId(null);
+          setShowPaymentSetup(true);
+          setCurrentStep('preview');
+          setIsAnalyzing(false);
+          setCurrentProcessingStep('');
+          clearSavedState(); // Clear saved state since we're not starting analysis yet
+          toast('Payment setup required before upload', { id: 'analysis', icon: 'ℹ️' });
+          return; // Exit early - payment modal will handle continuation
+        }
+      }
+
+      // Step 1: Upload file and start real AI analysis
+      setCurrentProcessingStep('Uploading file to analysis server...');
+      setAnalysisProgress(5);
+      toast.loading('Uploading file and starting AI analysis...', { id: 'analysis' });
+      
+      const uploadResult = await analysisAPI.uploadAndAnalyze(uploadedFile, isPublic);
+      const analysisId = uploadResult.analysis_id;
+      const analysisIdStr = String(analysisId);
+      setCurrentAnalysisId(typeof analysisId === 'string' ? parseInt(analysisId) : analysisId);
+      
+      toast.success(`Analysis started! ID: ${analysisId}`, { id: 'analysis' });
+      
+      // Continue with monitoring
+      await continueAnalysisMonitoring(analysisIdStr);
+      
+    } catch (error) {
+      console.error('Analysis failed:', error);
+      let errorMessage = 'Analysis failed. Please try again.';
+      
+      if (error instanceof Error) {
+        console.log('🔍 Detailed error information:');
+        console.log('- Error name:', error.name);
+        console.log('- Error message:', error.message);
+        console.log('- Error stack:', error.stack);
+        
+        if (error.message.includes('No file provided')) {
+          errorMessage = 'Please select a valid file to analyze.';
+        } else if (error.message.includes('timeout')) {
+          errorMessage = 'Analysis is taking longer than expected. Please check back later.';
+        } else if (error.message.includes('IPFS')) {
+          errorMessage = 'Failed to store results on IPFS. Please try again.';
+        } else if (error.message.includes('Blockchain') || error.message.includes('Contract')) {
+          errorMessage = 'Blockchain registration failed. Please check your wallet and try again.';
+        } else if (error.message.includes('failed')) {
+          const match = error.message.match(/Upload failed \((\d+)\): (.+)/);
+          if (match) {
+            const statusCode = match[1];
+            const serverError = match[2];
+            errorMessage = `Server error (${statusCode}): ${serverError}`;
+          } else {
+            errorMessage = `Server error: ${error.message}`;
+          }
+        } else {
+          errorMessage = error.message;
+        }
+      }
+      
+      toast.error(errorMessage, { id: 'analysis' });
+      setCurrentStep('preview');
+      setIsAnalyzing(false);
+      setCurrentProcessingStep('');
+      clearSavedState(); // Clear saved state on error
+    }
+  }, [uploadedFile, isPublic, isPaid, priceInFIL, focService, continueAnalysisMonitoring, saveState, clearSavedState, resetContract]);
 
   // ALL useEffect hooks MUST be called before any conditional logic
   // Set mounted state after component mounts
   useEffect(() => {
     setMounted(true);
     
-    // Restore state from sessionStorage if available
+    // Restore state from sessionStorage if available (only on mount)
     const savedState = sessionStorage.getItem('uploadState');
     if (savedState) {
       try {
@@ -565,13 +733,27 @@ const FileScopeApp = () => {
         if (parsedState.currentStep === 'processing') {
           console.log('🔄 Found processing state, attempting to restore...');
           
-          // Check if we have analysis results already stored
+          // Check if we have analysis results already stored AND transaction is confirmed
+          // Only navigate if everything is truly complete
           const existingResults = sessionStorage.getItem('analysisResults');
           if (existingResults) {
-            console.log('✅ Found existing results, navigating to results page');
-            clearSavedState();
-            router.push('/results');
-            return;
+            try {
+              const resultsData = JSON.parse(existingResults);
+              // Only navigate if we have confirmed blockchain data
+              if (resultsData.blockchainData && resultsData.blockchainData.status === 'confirmed') {
+                console.log('✅ Found completed results with confirmed transaction, navigating to results page');
+                clearSavedState();
+                router.push('/results');
+                return;
+              } else {
+                // Results exist but transaction not confirmed - clear and restart
+                console.log('⚠️ Results exist but transaction not confirmed, clearing state');
+                sessionStorage.removeItem('analysisResults');
+              }
+            } catch (e) {
+              console.error('Failed to parse existing results:', e);
+              sessionStorage.removeItem('analysisResults');
+            }
           }
           
           // If no results but we have an analysis ID, we might be able to check status
@@ -585,34 +767,49 @@ const FileScopeApp = () => {
                 console.log('📊 Analysis status:', status);
                 
                 if (status.status === 'completed') {
-                  console.log('🎉 Analysis already completed, processing results...');
+                  console.log('🎉 Analysis already completed, but continuing with storage and blockchain registration...');
+                  // Don't navigate immediately - continue with the full flow
+                  // Restore the UI state and continue from where we left off
+                  setCurrentStep('processing');
+                  setAnalysisProgress(70); // Analysis is done, continue with storage
+                  setCurrentAnalysisId(parsedState.currentAnalysisId);
+                  setIsAnalyzing(true);
+                  
+                  // Convert results and set them in state
                   const frontendResults = analysisAPI.convertToFrontendFormat(status);
+                  setAnalysisResults(frontendResults);
                   
-                  // Create mock file for results page
-                  const mockFile = new File([''], parsedState.fileName || 'unknown.csv', {
-                    type: parsedState.fileType || 'text/csv'
-                  });
-                  
-                  // Store results and navigate
-                  const resultsData = {
-                    results: frontendResults,
-                    fileName: mockFile.name,
-                    fileSize: parsedState.fileSize || 0,
-                    analysisId: parsedState.currentAnalysisId,
-                    timestamp: new Date().toISOString(),
-                    isPublic: parsedState.isPublic || false,
-                    ipfsHash: 'restored-' + Date.now(), // Placeholder
-                    blockchainData: {
-                      transactionHash: 'restored',
-                      blockNumber: 'restored',
-                      gasUsed: 'N/A',
-                      status: 'restored'
-                    }
-                  };
-                  
-                  sessionStorage.setItem('analysisResults', JSON.stringify(resultsData));
-                  clearSavedState();
-                  router.push('/results');
+                  // Restore file from IndexedDB if needed
+                  const dbService = getIndexedDBService();
+                  dbService.getFile()
+                    .then((storedFile) => {
+                      if (storedFile && storedFile.size > 0) {
+                        console.log('✅ Restored file from IndexedDB:', storedFile.name);
+                        setUploadedFile(storedFile);
+                      } else if (parsedState.fileName) {
+                        // Fallback to mock file if IndexedDB doesn't have it
+                        console.log('⚠️ File not in IndexedDB, using mock file');
+                        const mockFile = new File([''], parsedState.fileName, { 
+                          type: parsedState.fileType || 'text/csv',
+                          lastModified: Date.now()
+                        });
+                        setUploadedFile(mockFile);
+                      }
+                      
+                      // Continue with storage and blockchain registration
+                      // This will be handled by continueAnalysisMonitoring
+                      // It will skip the analysis wait since we already have results
+                      setTimeout(() => {
+                        continueAnalysisMonitoring(String(parsedState.currentAnalysisId));
+                      }, 100);
+                    })
+                    .catch((error) => {
+                      console.error('⚠️ Failed to restore file from IndexedDB:', error);
+                      // Continue anyway
+                      setTimeout(() => {
+                        continueAnalysisMonitoring(String(parsedState.currentAnalysisId));
+                      }, 100);
+                    });
                 } else if (status.status === 'failed' || status.status === 'error') {
                   console.log('❌ Analysis failed, clearing state');
                   toast.error('Previous analysis failed. Please try again.');
@@ -626,17 +823,41 @@ const FileScopeApp = () => {
                   setCurrentAnalysisId(parsedState.currentAnalysisId);
                   setIsAnalyzing(true);
                   
-                  // Restore file data if available
-                  if (parsedState.fileName) {
-                    const mockFile = new File([''], parsedState.fileName, { 
-                      type: parsedState.fileType || 'text/csv',
-                      lastModified: Date.now()
+                  // Try to restore file from IndexedDB
+                  const dbService = getIndexedDBService();
+                  dbService.getFile()
+                    .then((storedFile) => {
+                      if (storedFile && storedFile.size > 0) {
+                        console.log('✅ Restored file from IndexedDB:', storedFile.name);
+                        setUploadedFile(storedFile);
+                      } else if (parsedState.fileName) {
+                        // Fallback to mock file if IndexedDB doesn't have it
+                        console.log('⚠️ File not in IndexedDB, using mock file');
+                        const mockFile = new File([''], parsedState.fileName, { 
+                          type: parsedState.fileType || 'text/csv',
+                          lastModified: Date.now()
+                        });
+                        setUploadedFile(mockFile);
+                      }
+                      
+                      // Continue monitoring the analysis - call it after state is restored
+                      setTimeout(() => {
+                        continueAnalysisMonitoring(String(parsedState.currentAnalysisId));
+                      }, 100);
+                    })
+                    .catch((error) => {
+                      console.error('⚠️ Failed to restore file from IndexedDB:', error);
+                      if (parsedState.fileName) {
+                        const mockFile = new File([''], parsedState.fileName, { 
+                          type: parsedState.fileType || 'text/csv',
+                          lastModified: Date.now()
+                        });
+                        setUploadedFile(mockFile);
+                      }
+                      setTimeout(() => {
+                        continueAnalysisMonitoring(String(parsedState.currentAnalysisId));
+                      }, 100);
                     });
-                    setUploadedFile(mockFile);
-                  }
-                  
-                  // Continue monitoring the analysis
-                  continueAnalysisMonitoring(String(parsedState.currentAnalysisId));
                 }
               })
               .catch(error => {
@@ -673,7 +894,8 @@ const FileScopeApp = () => {
         toast.error('Failed to restore previous session.');
       }
     }
-  }, [router, clearSavedState]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Only run once on mount
 
   // Check wallet connection on mount
   useEffect(() => {
@@ -740,8 +962,18 @@ const FileScopeApp = () => {
         : 'Analysis completed and confirmed on blockchain! 🔒';
       toast.success(visibilityMsg, { id: 'analysis' });
       
-      // Clear saved processing state
+      // Clear saved processing state and IndexedDB
       clearSavedState();
+      
+      // Also clear IndexedDB explicitly after successful upload
+      const dbService = getIndexedDBService();
+      dbService.deleteFile()
+        .then(() => {
+          console.log('🗑️ Cleared IndexedDB after successful upload');
+        })
+        .catch((error) => {
+          console.error('⚠️ Failed to clear IndexedDB:', error);
+        });
       
       // Navigate to results page after a short delay to show completion
       setTimeout(() => {
@@ -828,143 +1060,232 @@ const FileScopeApp = () => {
                   <div className="absolute inset-0 border-4 border-blue-600 rounded-full animate-spin border-t-transparent"></div>
                   <BarChart3 className="w-8 h-8 text-blue-600 absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2" />
                 </div>
-                <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-4">Processing {uploadedFile?.name}</h2>
-                <p className="text-gray-600 dark:text-gray-300 mb-8">Running comprehensive AI analysis...</p>
+                <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-2">Processing {uploadedFile?.name}</h2>
+                {currentProcessingStep && (
+                  <p className="text-lg text-blue-600 dark:text-blue-400 mb-4 font-medium">
+                    {currentProcessingStep}
+                  </p>
+                )}
                 
                 {/* Real Progress Bar */}
-                <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2 mb-4">
+                <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-3 mb-4">
                   <div 
-                    className="bg-blue-600 h-2 rounded-full transition-all duration-500" 
+                    className="bg-gradient-to-r from-blue-600 to-indigo-600 h-3 rounded-full transition-all duration-500" 
                     style={{width: `${analysisProgress}%`}}
                   ></div>
                 </div>
-                <p className="text-sm text-gray-500 dark:text-gray-400">
-                  {Math.round(analysisProgress)}% complete
+                <div className="flex items-center justify-between text-sm text-gray-500 dark:text-gray-400">
+                  <span>{Math.round(analysisProgress)}% complete</span>
                   {currentAnalysisId && (
-                    <span className="block mt-1 text-xs">
+                    <span className="text-xs">
                       Analysis ID: {currentAnalysisId}
                     </span>
                   )}
-                  {blockchainData && (
-                    <span className="block mt-1 text-xs">
-                      Transaction: {blockchainData.slice(0, 10)}...
-                    </span>
-                  )}
-                </p>
+                </div>
+                {blockchainData && (
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">
+                    Transaction: {blockchainData.slice(0, 10)}...{blockchainData.slice(-8)}
+                  </p>
+                )}
               </div>
 
-              {/* Real Analysis Steps */}
-              <div className="space-y-4 mb-8">
-                {/* File Upload & Validation */}
-                <div className={`flex items-center space-x-4 p-4 rounded-lg border ${
-                  analysisProgress > 0 
-                    ? 'bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800' 
-                    : 'bg-blue-50 dark:bg-blue-900/30 border-blue-200 dark:border-blue-800'
-                }`}>
-                  {analysisProgress > 0 ? (
-                    <CheckCircle className="w-6 h-6 text-green-600 flex-shrink-0" />
-                  ) : (
-                    <Loader className="w-6 h-6 text-blue-600 flex-shrink-0 animate-spin" />
-                  )}
-                  <div className="flex-1">
-                    <div className={`font-medium ${
-                      analysisProgress > 0 ? 'text-green-900 dark:text-green-100' : 'text-blue-900 dark:text-blue-100'
-                    }`}>
-                      File Upload & Validation
-                    </div>
-                    <div className={`text-sm ${
-                      analysisProgress > 0 ? 'text-green-700 dark:text-green-300' : 'text-blue-700 dark:text-blue-300'
-                    }`}>
-                      {analysisProgress > 0 ? 'Dataset uploaded successfully' : 'Uploading to AI analysis server...'}
+              {/* Real Analysis Steps - Clear Step-by-Step Progress */}
+              <div className="space-y-3 mb-8">
+                {/* Step 1: Payment Setup (for paid datasets) */}
+                {isPaid && priceInFIL && parseFloat(priceInFIL) > 0 && (
+                  <div className={`flex items-center space-x-4 p-4 rounded-lg border ${
+                    analysisProgress >= 5
+                      ? 'bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800' 
+                      : analysisProgress >= 2
+                        ? 'bg-blue-50 dark:bg-blue-900/30 border-blue-200 dark:border-blue-800' 
+                        : 'bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700'
+                  }`}>
+                    {analysisProgress >= 5 ? (
+                      <CheckCircle className="w-6 h-6 text-green-600 flex-shrink-0" />
+                    ) : analysisProgress >= 2 ? (
+                      <Loader className="w-6 h-6 text-blue-600 flex-shrink-0 animate-spin" />
+                    ) : (
+                      <div className="w-6 h-6 border-2 border-gray-300 dark:border-gray-600 rounded-full flex-shrink-0"></div>
+                    )}
+                    <div className="flex-1">
+                      <div className={`font-medium ${
+                        analysisProgress >= 5 ? 'text-green-900 dark:text-green-100' : 
+                        analysisProgress >= 2 ? 'text-blue-900 dark:text-blue-100' : 'text-gray-600 dark:text-gray-300'
+                      }`}>
+                        Step 1: Payment Setup
+                      </div>
+                      <div className={`text-sm ${
+                        analysisProgress >= 5 ? 'text-green-700 dark:text-green-300' : 
+                        analysisProgress >= 2 ? 'text-blue-700 dark:text-blue-300' : 'text-gray-500 dark:text-gray-400'
+                      }`}>
+                        {currentProcessingStep && currentProcessingStep.includes('Checking payment') ? currentProcessingStep : 
+                         analysisProgress >= 5 ? 'Payment setup verified' : 
+                         'Verifying payment setup...'}
+                      </div>
                     </div>
                   </div>
-                </div>
+                )}
 
-                {/* AI Analysis */}
+                {/* Step 2: File Upload */}
                 <div className={`flex items-center space-x-4 p-4 rounded-lg border ${
-                  analysisProgress > 30 
+                  analysisProgress >= 10
                     ? 'bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800' 
-                    : analysisProgress > 10
+                    : analysisProgress >= 5
                       ? 'bg-blue-50 dark:bg-blue-900/30 border-blue-200 dark:border-blue-800' 
                       : 'bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700'
                 }`}>
-                  {analysisProgress > 30 ? (
+                  {analysisProgress >= 10 ? (
                     <CheckCircle className="w-6 h-6 text-green-600 flex-shrink-0" />
-                  ) : analysisProgress > 10 ? (
+                  ) : analysisProgress >= 5 ? (
                     <Loader className="w-6 h-6 text-blue-600 flex-shrink-0 animate-spin" />
                   ) : (
                     <div className="w-6 h-6 border-2 border-gray-300 dark:border-gray-600 rounded-full flex-shrink-0"></div>
                   )}
                   <div className="flex-1">
                     <div className={`font-medium ${
-                      analysisProgress > 30 ? 'text-green-900 dark:text-green-100' : 
-                      analysisProgress > 10 ? 'text-blue-900 dark:text-blue-100' : 'text-gray-600 dark:text-gray-300'
+                      analysisProgress >= 10 ? 'text-green-900 dark:text-green-100' : 
+                      analysisProgress >= 5 ? 'text-blue-900 dark:text-blue-100' : 'text-gray-600 dark:text-gray-300'
                     }`}>
-                      AI Analysis
+                      Step {isPaid && priceInFIL && parseFloat(priceInFIL) > 0 ? '2' : '1'}: File Upload
                     </div>
                     <div className={`text-sm ${
-                      analysisProgress > 30 ? 'text-green-700 dark:text-green-300' : 
-                      analysisProgress > 10 ? 'text-blue-700 dark:text-blue-300' : 'text-gray-500 dark:text-gray-400'
+                      analysisProgress >= 10 ? 'text-green-700 dark:text-green-300' : 
+                      analysisProgress >= 5 ? 'text-blue-700 dark:text-blue-300' : 'text-gray-500 dark:text-gray-400'
                     }`}>
-                      {analysisProgress > 30 ? 'Quality metrics and anomalies detected' : 
-                       analysisProgress > 10 ? 'Running comprehensive AI analysis...' : 
-                       'Pending AI analysis'}
+                      {currentProcessingStep && currentProcessingStep.includes('Uploading file') ? currentProcessingStep : 
+                       analysisProgress >= 10 ? 'File uploaded to analysis server' : 
+                       analysisProgress >= 5 ? 'Uploading file to analysis server...' : 
+                       'Preparing upload...'}
                     </div>
                   </div>
                 </div>
 
-                {/* Storage (FOC for paid, IPFS for free) */}
+                {/* Step 3: AI Analysis */}
                 <div className={`flex items-center space-x-4 p-4 rounded-lg border ${
-                  analysisProgress > 85 
+                  analysisProgress >= 70
                     ? 'bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800' 
-                    : analysisProgress > 80
+                    : analysisProgress >= 10
                       ? 'bg-blue-50 dark:bg-blue-900/30 border-blue-200 dark:border-blue-800' 
                       : 'bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700'
                 }`}>
-                  {analysisProgress > 85 ? (
+                  {analysisProgress >= 70 ? (
                     <CheckCircle className="w-6 h-6 text-green-600 flex-shrink-0" />
-                  ) : analysisProgress > 80 ? (
+                  ) : analysisProgress >= 10 ? (
                     <Loader className="w-6 h-6 text-blue-600 flex-shrink-0 animate-spin" />
                   ) : (
                     <div className="w-6 h-6 border-2 border-gray-300 dark:border-gray-600 rounded-full flex-shrink-0"></div>
                   )}
                   <div className="flex-1">
                     <div className={`font-medium ${
-                      analysisProgress > 85 ? 'text-green-900 dark:text-green-100' : 
-                      analysisProgress > 80 ? 'text-blue-900 dark:text-blue-100' : 'text-gray-600 dark:text-gray-300'
+                      analysisProgress >= 70 ? 'text-green-900 dark:text-green-100' : 
+                      analysisProgress >= 10 ? 'text-blue-900 dark:text-blue-100' : 'text-gray-600 dark:text-gray-300'
                     }`}>
-                      {isPaid ? 'Filecoin Onchain Cloud Storage' : 'IPFS Storage'}
+                      Step {isPaid && priceInFIL && parseFloat(priceInFIL) > 0 ? '3' : '2'}: AI Analysis
                     </div>
                     <div className={`text-sm ${
-                      analysisProgress > 85 ? 'text-green-700 dark:text-green-300' : 
-                      analysisProgress > 80 ? 'text-blue-700 dark:text-blue-300' : 'text-gray-500 dark:text-gray-400'
+                      analysisProgress >= 70 ? 'text-green-700 dark:text-green-300' : 
+                      analysisProgress >= 10 ? 'text-blue-700 dark:text-blue-300' : 'text-gray-500 dark:text-gray-400'
                     }`}>
-                      {analysisProgress > 85 
+                      {currentProcessingStep && (currentProcessingStep.includes('Analyzing') || currentProcessingStep.includes('Running AI'))
+                        ? currentProcessingStep 
+                        : analysisProgress >= 70 
+                          ? 'Analysis complete - Quality metrics, anomalies, and bias detected' 
+                          : analysisProgress >= 10 
+                            ? 'Running comprehensive AI analysis...' 
+                            : 'Waiting for analysis to start...'}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Step 4: Dataset Storage (FOC for paid, IPFS for free) */}
+                <div className={`flex items-center space-x-4 p-4 rounded-lg border ${
+                  analysisProgress >= 80
+                    ? 'bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800' 
+                    : analysisProgress >= 75
+                      ? 'bg-blue-50 dark:bg-blue-900/30 border-blue-200 dark:border-blue-800' 
+                      : 'bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700'
+                }`}>
+                  {analysisProgress >= 80 ? (
+                    <CheckCircle className="w-6 h-6 text-green-600 flex-shrink-0" />
+                  ) : analysisProgress >= 75 ? (
+                    <Loader className="w-6 h-6 text-blue-600 flex-shrink-0 animate-spin" />
+                  ) : (
+                    <div className="w-6 h-6 border-2 border-gray-300 dark:border-gray-600 rounded-full flex-shrink-0"></div>
+                  )}
+                  <div className="flex-1">
+                    <div className={`font-medium ${
+                      analysisProgress >= 80 ? 'text-green-900 dark:text-green-100' : 
+                      analysisProgress >= 75 ? 'text-blue-900 dark:text-blue-100' : 'text-gray-600 dark:text-gray-300'
+                    }`}>
+                      Step {isPaid && priceInFIL && parseFloat(priceInFIL) > 0 ? '4' : '3'}: Dataset Storage
+                    </div>
+                    <div className={`text-sm ${
+                      analysisProgress >= 80 ? 'text-green-700 dark:text-green-300' : 
+                      analysisProgress >= 75 ? 'text-blue-700 dark:text-blue-300' : 'text-gray-500 dark:text-gray-400'
+                    }`}>
+                      {analysisProgress >= 80 
                         ? (isPaid 
-                          ? 'Dataset stored on FOC with verifiable proofs' 
-                          : 'Results stored on IPFS')
-                        : analysisProgress > 80 
-                          ? (isPaid 
+                          ? `Dataset stored on Filecoin Onchain Cloud (PieceCID: ${focPieceCid ? focPieceCid.slice(0, 20) + '...' : 'N/A'})` 
+                          : `Dataset stored on IPFS (CID: ${ipfsHash ? ipfsHash.slice(0, 20) + '...' : 'N/A'})`)
+                        : analysisProgress >= 75 
+                          ? (currentProcessingStep || (isPaid 
                             ? 'Uploading to Filecoin Onchain Cloud...' 
-                            : 'Uploading to decentralized storage...')
+                            : 'Uploading to IPFS...'))
                           : (isPaid 
-                            ? 'Pending FOC storage' 
-                            : 'Pending IPFS storage')}
+                            ? 'Waiting to upload to FOC...' 
+                            : 'Waiting to upload to IPFS...')}
                     </div>
                   </div>
                 </div>
 
-                {/* Blockchain Registration */}
+                {/* Step 5: Analysis Results Storage */}
                 <div className={`flex items-center space-x-4 p-4 rounded-lg border ${
-                  analysisProgress >= 100 
+                  analysisProgress >= 90
                     ? 'bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800' 
-                    : analysisProgress > 95
+                    : analysisProgress >= 85
+                      ? 'bg-blue-50 dark:bg-blue-900/30 border-blue-200 dark:border-blue-800' 
+                      : 'bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700'
+                }`}>
+                  {analysisProgress >= 90 ? (
+                    <CheckCircle className="w-6 h-6 text-green-600 flex-shrink-0" />
+                  ) : analysisProgress >= 85 ? (
+                    <Loader className="w-6 h-6 text-blue-600 flex-shrink-0 animate-spin" />
+                  ) : (
+                    <div className="w-6 h-6 border-2 border-gray-300 dark:border-gray-600 rounded-full flex-shrink-0"></div>
+                  )}
+                  <div className="flex-1">
+                    <div className={`font-medium ${
+                      analysisProgress >= 90 ? 'text-green-900 dark:text-green-100' : 
+                      analysisProgress >= 85 ? 'text-blue-900 dark:text-blue-100' : 'text-gray-600 dark:text-gray-300'
+                    }`}>
+                      Step {isPaid && priceInFIL && parseFloat(priceInFIL) > 0 ? '5' : '4'}: Analysis Results Storage
+                    </div>
+                    <div className={`text-sm ${
+                      analysisProgress >= 90 ? 'text-green-700 dark:text-green-300' : 
+                      analysisProgress >= 85 ? 'text-blue-700 dark:text-blue-300' : 'text-gray-500 dark:text-gray-400'
+                    }`}>
+                      {currentProcessingStep && currentProcessingStep.includes('Storing analysis') 
+                        ? currentProcessingStep 
+                        : analysisProgress >= 90 
+                          ? 'Analysis results stored on IPFS' 
+                          : analysisProgress >= 85 
+                            ? 'Storing analysis results on IPFS...' 
+                            : 'Waiting to store analysis results...'}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Step 6: Blockchain Registration */}
+                <div className={`flex items-center space-x-4 p-4 rounded-lg border ${
+                  analysisProgress >= 100
+                    ? 'bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800' 
+                    : analysisProgress >= 95
                       ? 'bg-blue-50 dark:bg-blue-900/30 border-blue-200 dark:border-blue-800' 
                       : 'bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700'
                 }`}>
                   {analysisProgress >= 100 ? (
                     <CheckCircle className="w-6 h-6 text-green-600 flex-shrink-0" />
-                  ) : analysisProgress > 95 ? (
+                  ) : analysisProgress >= 95 ? (
                     <Loader className="w-6 h-6 text-blue-600 flex-shrink-0 animate-spin" />
                   ) : (
                     <div className="w-6 h-6 border-2 border-gray-300 dark:border-gray-600 rounded-full flex-shrink-0"></div>
@@ -972,17 +1293,23 @@ const FileScopeApp = () => {
                   <div className="flex-1">
                     <div className={`font-medium ${
                       analysisProgress >= 100 ? 'text-green-900 dark:text-green-100' : 
-                      analysisProgress > 95 ? 'text-blue-900 dark:text-blue-100' : 'text-gray-600 dark:text-gray-300'
+                      analysisProgress >= 95 ? 'text-blue-900 dark:text-blue-100' : 'text-gray-600 dark:text-gray-300'
                     }`}>
-                      Blockchain Registration
+                      Step {isPaid && priceInFIL && parseFloat(priceInFIL) > 0 ? '6' : '5'}: Blockchain Registration
                     </div>
                     <div className={`text-sm ${
                       analysisProgress >= 100 ? 'text-green-700 dark:text-green-300' : 
-                      analysisProgress > 95 ? 'text-blue-700 dark:text-blue-300' : 'text-gray-500 dark:text-gray-400'
+                      analysisProgress >= 95 ? 'text-blue-700 dark:text-blue-300' : 'text-gray-500 dark:text-gray-400'
                     }`}>
-                      {analysisProgress >= 100 ? 'Dataset registered on blockchain' : 
-                       analysisProgress > 95 ? 'Registering on Filecoin blockchain...' : 
-                       'Pending blockchain registration'}
+                      {currentProcessingStep && (currentProcessingStep.includes('Registering') || currentProcessingStep.includes('Waiting for transaction'))
+                        ? currentProcessingStep 
+                        : analysisProgress >= 100 
+                          ? (isTransactionConfirmed 
+                            ? 'Dataset registered and confirmed on blockchain!' 
+                            : 'Dataset registered on blockchain') 
+                          : analysisProgress >= 95 
+                            ? 'Registering on Filecoin blockchain...' 
+                            : 'Waiting for blockchain registration...'}
                     </div>
                   </div>
                 </div>
@@ -1447,11 +1774,21 @@ const FileScopeApp = () => {
             setIsAnalyzing(false);
             setCurrentStep('preview');
           }}
-          onComplete={() => {
+          onComplete={async () => {
             setShowPaymentSetup(false);
-            // Retry the upload after payment setup
-            if (uploadedFile && isPaid) {
-              continueAnalysisMonitoring(String(currentAnalysisId || ''));
+            // Restart the analysis flow after payment setup
+            if (uploadedFile && uploadedFile.size > 0) {
+              // Clear any stale state
+              setCurrentAnalysisId(null);
+              setPendingAnalysisId(null);
+              // Payment is now set up, start the analysis from scratch
+              // Use setTimeout to ensure modal closes before starting analysis
+              setTimeout(() => {
+                startAnalysis();
+              }, 100);
+            } else {
+              toast.error('File not found. Please upload your file again.');
+              setCurrentStep('upload');
             }
           }}
           focService={focService}

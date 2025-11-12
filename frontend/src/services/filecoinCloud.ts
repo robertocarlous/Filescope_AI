@@ -142,12 +142,28 @@ export class FilecoinCloudService {
     }
 
     try {
+      // Validate file
+      if (!file || file.size === 0) {
+        throw new Error('Invalid file: File is empty or not provided');
+      }
+
+      console.log(`📤 Uploading ${file.name} to Filecoin Onchain Cloud...`);
+      console.log(`📊 File details:`, {
+        name: file.name,
+        size: file.size,
+        sizeMB: (file.size / 1024 / 1024).toFixed(2),
+        type: file.type
+      });
+
       // Convert file to Uint8Array
       const arrayBuffer = await file.arrayBuffer();
       const data = new Uint8Array(arrayBuffer);
 
-      console.log(`📤 Uploading ${file.name} to Filecoin Onchain Cloud...`);
-      console.log(`📊 File size: ${(file.size / 1024 / 1024).toFixed(2)} MB`);
+      if (data.length === 0) {
+        throw new Error('File data is empty after conversion');
+      }
+
+      console.log(`📊 Converted to Uint8Array: ${data.length} bytes`);
 
       // Upload with metadata
       const result = await this.synapse.storage.upload(data, {
@@ -162,7 +178,18 @@ export class FilecoinCloudService {
       };
     } catch (error) {
       console.error('❌ Failed to upload dataset:', error);
-      throw new Error(`Failed to upload dataset: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      
+      // Provide more helpful error messages
+      if (errorMessage.includes('404') || errorMessage.includes('Not Found')) {
+        throw new Error('FOC service endpoint not found. Please check your network connection and try again.');
+      } else if (errorMessage.includes('insufficient')) {
+        throw new Error('Insufficient USDFC balance. Please deposit more tokens.');
+      } else if (errorMessage.includes('empty')) {
+        throw new Error('File is empty. Please upload a valid file.');
+      }
+      
+      throw new Error(`Failed to upload dataset: ${errorMessage}`);
     }
   }
 
