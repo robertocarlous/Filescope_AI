@@ -1048,22 +1048,11 @@ const DatasetExplorer = () => {
       }
 
       // Allowance is sufficient, proceed with purchase
-      toast.loading('Estimating gas...', { id: 'purchase' });
-      
-      // Estimate gas for the purchase transaction
-      const { estimateGas } = await import('wagmi/actions');
-      const estimatedGas = await estimateGas(wagmiConfig, {
-        account: address,
-        address: fileStoreContract.address as `0x${string}`,
-        abi: fileStoreContract.abi,
-        functionName: 'purchaseDataset',
-        args: [BigInt(selectedDataset.id), paymentTokenAddress],
-      });
-      
-      // Add 30% buffer to estimated gas for Filecoin transactions
-      const gasLimit = (estimatedGas * BigInt(130)) / BigInt(100);
-      
       toast.loading('Processing purchase...', { id: 'purchase' });
+      
+      // Use a high gas limit for Filecoin transactions (gas estimation can be unreliable)
+      // 15M gas should be sufficient for purchase transactions
+      const gasLimit = BigInt(15000000);
       
       writeContract({
         address: fileStoreContract.address as `0x${string}`,
@@ -1097,45 +1086,21 @@ const DatasetExplorer = () => {
       setNeedsApproval(false);
       toast.success('Token approved! Proceeding with purchase...', { id: 'approval' });
       
-      // Now execute the purchase with gas estimation
-      setTimeout(async () => {
-        try {
-          toast.loading('Estimating gas...', { id: 'purchase' });
-          
-          // Estimate gas for the purchase transaction
-          const { estimateGas } = await import('wagmi/actions');
-          const estimatedGas = await estimateGas(wagmiConfig, {
-            account: address,
-            address: fileStoreContract.address as `0x${string}`,
-            abi: fileStoreContract.abi,
-            functionName: 'purchaseDataset',
-            args: [BigInt(selectedDataset.id), approvalTokenAddress],
-          });
-          
-          // Add 30% buffer to estimated gas for Filecoin transactions
-          const gasLimit = (estimatedGas * BigInt(130)) / BigInt(100);
-          
-          toast.loading('Processing purchase...', { id: 'purchase' });
-          
-          writeContract({
-            address: fileStoreContract.address as `0x${string}`,
-            abi: fileStoreContract.abi,
-            functionName: 'purchaseDataset',
-            args: [BigInt(selectedDataset.id), approvalTokenAddress],
-            gas: gasLimit,
-          });
-        } catch (error) {
-          console.error('Gas estimation failed, using default:', error);
-          // Fallback: use a high gas limit if estimation fails
-          writeContract({
-            address: fileStoreContract.address as `0x${string}`,
-            abi: fileStoreContract.abi,
-            functionName: 'purchaseDataset',
-            args: [BigInt(selectedDataset.id), approvalTokenAddress],
-            gas: BigInt(10000000), // 10M gas as fallback
-          });
-          toast.loading('Processing purchase...', { id: 'purchase' });
-        }
+      // Now execute the purchase with high gas limit
+      setTimeout(() => {
+        toast.loading('Processing purchase...', { id: 'purchase' });
+        
+        // Use a high gas limit for Filecoin transactions (gas estimation can be unreliable)
+        // 15M gas should be sufficient for purchase transactions
+        const gasLimit = BigInt(15000000);
+        
+        writeContract({
+          address: fileStoreContract.address as `0x${string}`,
+          abi: fileStoreContract.abi,
+          functionName: 'purchaseDataset',
+          args: [BigInt(selectedDataset.id), approvalTokenAddress],
+          gas: gasLimit,
+        });
       }, 1000);
     }
   }, [needsApproval, approvalTokenAddress, isApprovalConfirmed, selectedDataset, writeContract, address]);
