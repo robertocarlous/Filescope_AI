@@ -1,16 +1,17 @@
 'use client'
 import React, { useState, useEffect, useCallback } from 'react';
 import Link from 'next/link';
-import { useReadContract, useWriteContract, useAccount, useWaitForTransactionReceipt } from 'wagmi';
+import { useReadContract, useAccount } from 'wagmi';
 import { 
   Search, Grid, List, Database, Eye, Download, 
   Verified, ArrowLeft, AlertTriangle, FileText, ShoppingCart
 } from 'lucide-react';
 import toast from 'react-hot-toast';
+import { ethers } from 'ethers';
 import { fileStoreContract } from '../index';
 import { getFilecoinCloudService } from '../../services/filecoinCloud';
-import { wagmiConfig } from '../../lib/web3';
 import JSZip from 'jszip';
+import jsPDF from 'jspdf';
 
 // Proper TypeScript interfaces
 interface ContractDataset {
@@ -206,19 +207,25 @@ const DatasetExplorer = () => {
   const [myPurchases, setMyPurchases] = useState<Set<number>>(new Set());
   
   const { address, isConnected } = useAccount();
-  const { writeContract, data: purchaseHash, isPending: isPurchasing } = useWriteContract();
-  const { writeContract: writeApproval, data: approvalHash, isPending: isApproving } = useWriteContract();
-  const { isLoading: isConfirming, isSuccess: isPurchaseConfirmed } = useWaitForTransactionReceipt({
-    hash: purchaseHash,
-  });
-  const { isLoading: isApprovalConfirming, isSuccess: isApprovalConfirmed } = useWaitForTransactionReceipt({
-    hash: approvalHash,
-  });
+  
+  // State for ethers-based transactions
+  const [isPurchasing, setIsPurchasing] = useState(false);
+  const [isApproving, setIsApproving] = useState(false);
+  const [isPurchaseConfirmed, setIsPurchaseConfirmed] = useState(false);
+  const [isApprovalConfirmed, setIsApprovalConfirmed] = useState(false);
 
+  // Get all public datasets from contract (already filtered by contract)
   const { data: contractDatasets, isLoading: contractLoading } = useReadContract({
     address: fileStoreContract.address as `0x${string}`,
     abi: fileStoreContract.abi,
     functionName: 'getAllPublicDatasets',
+  });
+
+  // Get total dataset count to create CID -> ID mapping
+  const { data: totalDatasetsCount } = useReadContract({
+    address: fileStoreContract.address as `0x${string}`,
+    abi: fileStoreContract.abi,
+    functionName: 'totalDatasets',
   });
 
   // Fetch user's purchases
@@ -283,14 +290,73 @@ const DatasetExplorer = () => {
     }
   }, [isPurchaseConfirmed, selectedDataset, isConnected, address, refetchPurchases]);
 
+  // Helper function to fetch from IPFS with multiple gateway fallbacks
+  const fetchFromIPFS = useCallback(async (cid: string): Promise<Blob> => {
+    // List of IPFS gateways to try (in order of preference)
+    const gateways = [
+      `https://ipfs.io/ipfs/${cid}`,
+      `https://gateway.ipfs.io/ipfs/${cid}`,
+      `https://cloudflare-ipfs.com/ipfs/${cid}`,
+      `https://dweb.link/ipfs/${cid}`,
+      `https://ipfs.filebase.io/ipfs/${cid}`,
+      `https://gateway.pinata.cloud/ipfs/${cid}`,
+    ];
+
+    let lastError: Error | null = null;
+
+    for (const gateway of gateways) {
+      try {
+        const response = await fetch(gateway, {
+          method: 'GET',
+          headers: {
+            'Accept': '*/*',
+          },
+        });
+
+        if (response.ok) {
+          return await response.blob();
+        }
+
+        // If we get a 429 (rate limit), try next gateway
+        if (response.status === 429) {
+          console.warn(`Rate limited on ${gateway}, trying next gateway...`);
+          lastError = new Error(`Rate limited on ${gateway}`);
+          continue;
+        }
+
+        // For other errors, throw immediately
+        throw new Error(`Failed to fetch from ${gateway}: ${response.status} ${response.statusText}`);
+      } catch (error: any) {
+        // CORS errors or network errors - try next gateway
+        if (
+          error?.message?.includes('CORS') ||
+          error?.message?.includes('Failed to fetch') ||
+          error?.message?.includes('NetworkError') ||
+          error?.name === 'TypeError'
+        ) {
+          console.warn(`CORS/Network error on ${gateway}, trying next gateway...`);
+          lastError = error;
+          continue;
+        }
+
+        // For other errors, try next gateway but log it
+        console.warn(`Error fetching from ${gateway}:`, error);
+        lastError = error;
+        continue;
+      }
+    }
+
+    // If all gateways failed, throw the last error
+    throw lastError || new Error('All IPFS gateways failed. Please try again later.');
+  }, []);
+
   // Fetch IPFS data helper
   const fetchIPFSData = useCallback(async (cid: string): Promise<IPFSData> => {
     try {
-      const response = await fetch(`https://gateway.pinata.cloud/ipfs/${cid}`);
-      if (!response.ok) {
-        throw new Error(`IPFS fetch failed: ${response.statusText}`);
-      }
-      const data = await response.json();
+      // Use fallback gateways for fetching IPFS data (JSON)
+      const blob = await fetchFromIPFS(cid);
+      const text = await blob.text();
+      const data = JSON.parse(text);
       console.log('📊 IPFS data received:', JSON.stringify(data, null, 2));
       
       // Handle different IPFS data structures
@@ -504,7 +570,7 @@ const DatasetExplorer = () => {
         }
       };
     }
-  }, []);
+  }, [fetchFromIPFS]);
 
   // Helper function to extract metrics from attributes
   const extractMetricFromAttributes = (attributes: Array<{ trait_type: string; value: string | number }>, metricName: string, defaultValue: number): number => {
@@ -740,13 +806,15 @@ const DatasetExplorer = () => {
     };
   };
 
-  // Process contract data
+  // Process contract data - use getAllPublicDatasets which already filters correctly
   useEffect(() => {
     if (mounted && contractDatasets && !contractLoading) {
       const processDatasets = async () => {
         try {
           setLoading(true);
           const processedDatasets: Dataset[] = [];
+          const { readContract } = await import('wagmi/actions');
+          const { wagmiConfig } = await import('../../lib/web3');
 
           // Type guard to ensure contractDatasets is an array
           if (!Array.isArray(contractDatasets)) {
@@ -756,63 +824,72 @@ const DatasetExplorer = () => {
             return;
           }
 
+          // getAllPublicDatasets already filters for isPublic && !isPrivate
+          // But it doesn't return dataset IDs, so we need to find them by matching CIDs
+          const totalCount = totalDatasetsCount ? Number(totalDatasetsCount) : 0;
+          
+          // Create a mapping from datasetCID to datasetId by checking all datasets
+          const cidToIdMap = new Map<string, number>();
+          for (let datasetId = 0; datasetId < totalCount; datasetId++) {
+            try {
+              const dataset = await readContract(wagmiConfig, {
+                address: fileStoreContract.address as `0x${string}`,
+                abi: fileStoreContract.abi,
+                functionName: 'getDataset',
+                args: [BigInt(datasetId)],
+              }) as ContractDataset;
+              
+              // Map both datasetCID and analysisCID to the dataset ID
+              cidToIdMap.set(dataset.datasetCID, datasetId);
+              cidToIdMap.set(dataset.analysisCID, datasetId);
+            } catch (error) {
+              // Skip datasets we can't access (private datasets)
+              continue;
+            }
+          }
+
+          console.log(`🔍 Processing ${contractDatasets.length} public datasets from getAllPublicDatasets...`);
+
+          // Process each public dataset from getAllPublicDatasets
           for (let i = 0; i < contractDatasets.length; i++) {
             const contractDataset = contractDatasets[i] as ContractDataset;
             
             try {
+              // Find the dataset ID by matching the datasetCID
+              const datasetId = cidToIdMap.get(contractDataset.datasetCID);
+              
+              if (datasetId === undefined) {
+                console.warn(`Could not find dataset ID for CID: ${contractDataset.datasetCID}`);
+                // Fallback: use index as ID (not ideal, but better than nothing)
+                // Actually, skip this dataset if we can't find its ID
+                continue;
+              }
+
+              // Double-check: ensure this dataset is actually public and not private
+              // (This should already be filtered by getAllPublicDatasets, but let's be safe)
+              if (!contractDataset.isPublic || contractDataset.isPrivate) {
+                console.log(`⏭️ Skipping dataset ${datasetId} - isPublic: ${contractDataset.isPublic}, isPrivate: ${contractDataset.isPrivate}`);
+                continue;
+              }
+
               const ipfsData = await fetchIPFSData(contractDataset.analysisCID);
               
               // Debug logging to see what data we have
-              console.log(`🔍 Processing dataset ${i}:`, {
+              console.log(`🔍 Processing dataset ${datasetId}:`, {
                 name: ipfsData.name,
-                attributes: ipfsData.attributes,
-                results: ipfsData.results,
-                metadata: ipfsData.metadata
+                isPublic: contractDataset.isPublic,
+                isPrivate: contractDataset.isPrivate,
+                isPaid: contractDataset.isPaid
               });
               
               // Add safety checks for IPFS data structure
               if (!ipfsData || !ipfsData.name) {
-                console.warn(`Dataset ${i} has incomplete IPFS data:`, ipfsData);
+                console.warn(`Dataset ${datasetId} has incomplete IPFS data:`, ipfsData);
                 continue; // Skip this dataset
-              }
-              
-              // Debug: Log all possible sources for rows/columns
-              console.log(`📊 Dataset ${i} rows/columns sources:`, {
-                'ipfsData.results?.metadata?.rows': ipfsData.results?.metadata?.rows,
-                'ipfsData.results?.metadata?.columns': ipfsData.results?.metadata?.columns,
-                'ipfsData.metadata?.rows': ipfsData.metadata?.rows,
-                'ipfsData.metadata?.columns': ipfsData.metadata?.columns,
-                'attributes with "Rows"': ipfsData.attributes.filter(attr => 
-                  attr.trait_type.toLowerCase().includes('row')
-                ),
-                'attributes with "Columns"': ipfsData.attributes.filter(attr => 
-                  attr.trait_type.toLowerCase().includes('column')
-                ),
-                'all attributes': ipfsData.attributes
-              });
-              
-              // Special debugging for txt.csv dataset
-              if (ipfsData.name === 'txt.csv') {
-                console.log('🔍 Special debugging for txt.csv:', {
-                  name: ipfsData.name,
-                  allAttributes: ipfsData.attributes,
-                  resultsMetadata: ipfsData.results?.metadata,
-                  directMetadata: ipfsData.metadata,
-                  extractedRows: extractMetricFromAttributes(ipfsData.attributes, 'Rows', 0),
-                  extractedColumns: extractMetricFromAttributes(ipfsData.attributes, 'Columns', 0)
-                });
               }
 
               // Use the comprehensive extraction function
               const { rows, columns } = extractRowsAndColumns(ipfsData);
-              
-              // Debug logging for extracted values
-              console.log(`📊 Dataset ${i} extracted values:`, {
-                rows,
-                columns,
-                fileSize: getAttributeValue<string>(ipfsData.attributes, 'File Size', 'Unknown'),
-                format: getAttributeValue<string>(ipfsData.attributes, 'File Type', 'Unknown')
-              });
 
               // Convert price from wei to USDFC (1 USDFC = 10^18 wei)
               const priceInFILWei = contractDataset.priceInFIL || BigInt(0);
@@ -822,12 +899,12 @@ const DatasetExplorer = () => {
               const priceInFIL = formatPrice(priceInFILRaw);
 
               const dataset: Dataset = {
-                id: i + 1,
-                title: ipfsData.name || `Dataset ${i + 1}`,
+                id: datasetId, // Use the correct dataset ID from contract
+                title: ipfsData.name || `Dataset ${datasetId + 1}`,
                 description: ipfsData.description || 'AI-analyzed dataset',
                 category: 'Technology', // Default category
                 metadata: {
-                  fileName: ipfsData.name || `Dataset ${i + 1}`,
+                  fileName: ipfsData.name || `Dataset ${datasetId + 1}`,
                   fileSize: getAttributeValue<string>(ipfsData.attributes, 'File Size', 'Unknown'),
                   rows: rows,
                   columns: columns,
@@ -837,6 +914,7 @@ const DatasetExplorer = () => {
                   contractAddress: fileStoreContract.address,
                   blockNumber: '0',
                   isPublic: contractDataset.isPublic,
+                  isPrivate: contractDataset.isPrivate || false,
                   description: ipfsData.description || 'No description available',
                   tags: ipfsData.attributes.filter(attr => attr.trait_type === 'tags')?.map(attr => attr.value as string) || [],
                   format: getAttributeValue<string>(ipfsData.attributes, 'File Type', 'Unknown')
@@ -846,7 +924,7 @@ const DatasetExplorer = () => {
                   priceInFIL,
                   priceInFILWei,
                 },
-                isPurchased: myPurchases.has(i + 1),
+                isPurchased: myPurchases.has(datasetId),
                 results: {
                   metrics: {
                     quality_score: ipfsData.results?.metrics?.quality_score || 0,
@@ -912,7 +990,7 @@ const DatasetExplorer = () => {
 
       processDatasets();
     }
-  }, [mounted, contractDatasets, contractLoading, fetchIPFSData, myPurchases]);
+  }, [mounted, contractDatasets, contractLoading, totalDatasetsCount, fetchIPFSData, myPurchases]);
 
   // Helper functions
   const getAttributeValue = <T extends string | number>(attributes: Array<{ trait_type: string; value: string | number }>, traitType: string, defaultValue: T): T => {
@@ -950,6 +1028,18 @@ const DatasetExplorer = () => {
 
   // Purchase dataset handler
   const handlePurchase = (dataset: Dataset) => {
+    // Only allow purchase for paid datasets
+    if (!dataset.pricing.isPaid || dataset.pricing.priceInFILWei === BigInt(0)) {
+      toast.error('This dataset is free. You can download it directly without purchase.');
+      return;
+    }
+
+    // Check if already purchased
+    if (dataset.isPurchased) {
+      toast.info('You already own this dataset. Purchases are one-time and grant permanent access. You can download it anytime from the download buttons.');
+      return;
+    }
+
     if (!isConnected) {
       toast.error('Please connect your wallet to purchase datasets');
       return;
@@ -962,24 +1052,51 @@ const DatasetExplorer = () => {
   const [needsApproval, setNeedsApproval] = useState(false);
   const [approvalTokenAddress, setApprovalTokenAddress] = useState<`0x${string}` | null>(null);
 
-  // Execute purchase transaction with approval
+  // Execute purchase transaction with approval using ethers
   const executePurchase = async () => {
     if (!selectedDataset || !isConnected || !address) {
       toast.error('Please connect your wallet');
       return;
     }
 
+    // Check if dataset is private (private datasets cannot be purchased)
+    if (selectedDataset.metadata.isPrivate) {
+      toast.error('This dataset is private and cannot be purchased. Private datasets are only accessible to the owner.');
+      setPurchaseModalOpen(false);
+      return;
+    }
+
+    // Check if dataset is actually paid
+    if (!selectedDataset.pricing.isPaid || selectedDataset.pricing.priceInFILWei === BigInt(0)) {
+      toast.error('This dataset is free and does not require purchase. You can download it directly.');
+      setPurchaseModalOpen(false);
+      return;
+    }
+
+    // Check if already purchased
+    if (selectedDataset.isPurchased) {
+      toast.error('You have already purchased this dataset. Purchases are one-time and grant permanent access. You can download it anytime.');
+      setPurchaseModalOpen(false);
+      return;
+    }
+
+    if (!window.ethereum) {
+      toast.error('Ethereum provider not found');
+      return;
+    }
+
     try {
+      // Initialize ethers provider
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      const signer = await provider.getSigner();
+
       // Use USDFC token address for Calibration testnet
-      // Contract address: 0xb3042734b608a1B16e9e86B374A3f3e389B4cDf0
       const USDFC_ADDRESS = '0xb3042734b608a1B16e9e86B374A3f3e389B4cDf0' as `0x${string}`;
       
       // Check if USDFC is in accepted tokens, otherwise use it directly
-      // (The contract owner should add it, but we'll use it anyway)
       let paymentTokenAddress: `0x${string}` = USDFC_ADDRESS;
       
       if (acceptedTokens && Array.isArray(acceptedTokens) && acceptedTokens.length > 0) {
-        // Prefer USDFC if it's in the list, otherwise use first accepted token
         const usdfcInList = acceptedTokens.find((addr: string) => 
           addr.toLowerCase() === USDFC_ADDRESS.toLowerCase()
         );
@@ -990,136 +1107,542 @@ const DatasetExplorer = () => {
         }
       }
 
-      const { readContract } = await import('wagmi/actions');
-
-      // ERC20 ABI for allowance and approve
+      // ERC20 ABI for allowance, approve, and balanceOf
       const ERC20_ABI = [
-        {
-          name: 'allowance',
-          type: 'function',
-          stateMutability: 'view',
-          inputs: [
-            { name: 'owner', type: 'address' },
-            { name: 'spender', type: 'address' }
-          ],
-          outputs: [{ name: '', type: 'uint256' }]
-        },
-        {
-          name: 'approve',
-          type: 'function',
-          stateMutability: 'nonpayable',
-          inputs: [
-            { name: 'spender', type: 'address' },
-            { name: 'amount', type: 'uint256' }
-          ],
-          outputs: [{ name: '', type: 'bool' }]
-        }
-      ] as const;
+        'function allowance(address owner, address spender) view returns (uint256)',
+        'function approve(address spender, uint256 amount) returns (bool)',
+        'function balanceOf(address account) view returns (uint256)'
+      ];
 
-      // Check current allowance
-      const currentAllowance = await readContract(wagmiConfig, {
-        address: paymentTokenAddress,
-        abi: ERC20_ABI,
-        functionName: 'allowance',
-        args: [address, fileStoreContract.address as `0x${string}`],
-      });
+      // Create contract instances
+      const tokenContract = new ethers.Contract(paymentTokenAddress, ERC20_ABI, signer);
+      const fileStoreContractInstance = new ethers.Contract(
+        fileStoreContract.address,
+        fileStoreContract.abi,
+        signer
+      );
 
       const priceInWei = selectedDataset.pricing.priceInFILWei;
+      
+      // Check user's token balance first
+      const balance = await tokenContract.balanceOf(address);
+      if (balance < priceInWei) {
+        throw new Error(`Insufficient USDFC balance. You have ${ethers.formatUnits(balance, 18)} USDFC, but need ${ethers.formatUnits(priceInWei, 18)} USDFC.`);
+      }
+
+      // Check current allowance
+      const currentAllowance = await tokenContract.allowance(address, fileStoreContract.address);
       
       // If allowance is insufficient, we need to approve first
       if (currentAllowance < priceInWei) {
         setNeedsApproval(true);
         setApprovalTokenAddress(paymentTokenAddress);
+        setIsApproving(true);
         
         toast.loading('Approving USDFC token...', { id: 'approval' });
         
         // Approve a larger amount to avoid repeated approvals (1000x the price)
         const approvalAmount = priceInWei * BigInt(1000);
         
-        writeApproval({
-          address: paymentTokenAddress,
-          abi: ERC20_ABI,
-          functionName: 'approve',
-          args: [fileStoreContract.address as `0x${string}`, approvalAmount],
-        });
+        try {
+          const approveTx = await tokenContract.approve(fileStoreContract.address, approvalAmount);
+          toast.loading('Waiting for approval confirmation...', { id: 'approval' });
+          await approveTx.wait();
+          
+          setIsApprovalConfirmed(true);
+          setIsApproving(false);
+          toast.success('Token approved! Proceeding with purchase...', { id: 'approval' });
+          
+          // Proceed with purchase after approval
+          await executePurchaseTransaction(signer, fileStoreContractInstance, paymentTokenAddress);
+        } catch (error) {
+          setIsApproving(false);
+          setNeedsApproval(false);
+          throw error;
+        }
         
-        // Don't proceed with purchase yet - wait for approval confirmation
         return;
       }
 
       // Allowance is sufficient, proceed with purchase
-      toast.loading('Processing purchase...', { id: 'purchase' });
-      
-      // Use a high gas limit for Filecoin transactions (gas estimation can be unreliable)
-      // 15M gas should be sufficient for purchase transactions
-      const gasLimit = BigInt(15000000);
-      
-      writeContract({
-        address: fileStoreContract.address as `0x${string}`,
-        abi: fileStoreContract.abi,
-        functionName: 'purchaseDataset',
-        args: [BigInt(selectedDataset.id), paymentTokenAddress],
-        gas: gasLimit,
-      });
+      await executePurchaseTransaction(signer, fileStoreContractInstance, paymentTokenAddress);
       
     } catch (error) {
       console.error('Purchase failed:', error);
+      setIsPurchasing(false);
+      setIsApproving(false);
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       
-      if (errorMessage.includes('insufficient') || errorMessage.includes('balance')) {
+      if (errorMessage.includes('already purchased') || errorMessage.includes('already owns')) {
+        toast.error('You have already purchased this dataset.', { id: 'purchase' });
+      } else if (errorMessage.includes('insufficient') || errorMessage.includes('balance')) {
         toast.error('Insufficient USDFC balance. Please ensure you have enough tokens.', { id: 'purchase' });
       } else if (errorMessage.includes('allowance') || errorMessage.includes('approve')) {
         toast.error('Token approval failed. Please try again.', { id: 'purchase' });
       } else if (errorMessage.includes('not accepted') || errorMessage.includes('Payment token')) {
         toast.error('Payment token not accepted by contract. Please contact support.', { id: 'purchase' });
+      } else if (errorMessage.includes('not found') || errorMessage.includes('does not exist')) {
+        toast.error('Dataset not found. It may have been removed.', { id: 'purchase' });
+      } else if (errorMessage.includes('not for sale') || errorMessage.includes('not available')) {
+        toast.error('This dataset is not available for purchase.', { id: 'purchase' });
+      } else if (errorMessage.includes('revert') || errorMessage.includes('Transaction reverted')) {
+        toast.error('Transaction reverted. Please check if you have sufficient balance and the dataset is available.', { id: 'purchase' });
       } else if (errorMessage.includes('gas') || errorMessage.includes('out of gas') || errorMessage.includes('SysErrOutOfGas')) {
-        toast.error('Transaction failed due to insufficient gas. Gas estimation and buffer have been applied.', { id: 'purchase' });
+        toast.error('Transaction failed due to insufficient gas.', { id: 'purchase' });
       } else {
         toast.error(`Purchase failed: ${errorMessage}`, { id: 'purchase' });
       }
     }
   };
 
-  // Handle approval confirmation and proceed with purchase
-  useEffect(() => {
-    if (needsApproval && approvalTokenAddress && isApprovalConfirmed && selectedDataset) {
-      setNeedsApproval(false);
-      toast.success('Token approved! Proceeding with purchase...', { id: 'approval' });
-      
-      // Now execute the purchase with high gas limit
-      setTimeout(() => {
-        toast.loading('Processing purchase...', { id: 'purchase' });
-        
-        // Use a high gas limit for Filecoin transactions (gas estimation can be unreliable)
-        // 15M gas should be sufficient for purchase transactions
-        const gasLimit = BigInt(15000000);
-        
-        writeContract({
-          address: fileStoreContract.address as `0x${string}`,
-          abi: fileStoreContract.abi,
-          functionName: 'purchaseDataset',
-          args: [BigInt(selectedDataset.id), approvalTokenAddress],
-          gas: gasLimit,
-        });
-      }, 1000);
+  // Helper function to execute the purchase transaction
+  const executePurchaseTransaction = async (
+    signer: ethers.JsonRpcSigner,
+    contract: ethers.Contract,
+    paymentTokenAddress: `0x${string}`
+  ) => {
+    if (!selectedDataset) return;
+
+    // Double-check that this is a paid dataset
+    if (!selectedDataset.pricing.isPaid || selectedDataset.pricing.priceInFILWei === BigInt(0)) {
+      setIsPurchasing(false);
+      throw new Error('This dataset is free and does not require purchase. You can download it directly.');
     }
-  }, [needsApproval, approvalTokenAddress, isApprovalConfirmed, selectedDataset, writeContract, address]);
+
+    setIsPurchasing(true);
+    toast.loading('Processing purchase...', { id: 'purchase' });
+
+    try {
+      console.log('🔍 Starting purchase transaction...', {
+        datasetId: selectedDataset.id,
+        paymentToken: paymentTokenAddress,
+        isPaid: selectedDataset.pricing.isPaid,
+        priceWei: selectedDataset.pricing.priceInFILWei.toString(),
+        isPurchased: selectedDataset.isPurchased
+      });
+
+      // Estimate gas or use a high limit
+      let gasLimit: bigint;
+      try {
+        gasLimit = await contract.purchaseDataset.estimateGas(
+          BigInt(selectedDataset.id),
+          paymentTokenAddress
+        );
+        // Add 30% buffer
+        gasLimit = (gasLimit * BigInt(130)) / BigInt(100);
+        console.log('✅ Gas estimated:', gasLimit.toString());
+      } catch (gasError: any) {
+        console.warn('⚠️ Gas estimation failed, using fixed limit:', gasError?.message);
+        // If estimation fails, use a high fixed limit
+        gasLimit = BigInt(15000000);
+      }
+
+      // Try a static call first to check if the transaction would succeed
+      try {
+        console.log('🔍 Validating purchase with static call...');
+        
+        await contract.purchaseDataset.staticCall(
+          BigInt(selectedDataset.id),
+          paymentTokenAddress
+        );
+        console.log('✅ Static call passed - transaction should succeed');
+      } catch (staticError: any) {
+        setIsPurchasing(false);
+        
+        // Try to extract revert reason from ethers error
+        let revertReason = 'Transaction would revert';
+        if (staticError?.reason) {
+          revertReason = staticError.reason;
+        } else if (staticError?.error?.data) {
+          // Try to decode the revert reason from error data
+          try {
+            const decoded = contract.interface.parseError(staticError.error.data);
+            revertReason = decoded?.name || revertReason;
+          } catch {
+            revertReason = staticError.error.data;
+          }
+        } else if (staticError?.message) {
+          revertReason = staticError.message;
+        }
+        
+        console.error('❌ Static call failed:', {
+          error: staticError,
+          reason: revertReason,
+          fullError: JSON.stringify(staticError, Object.getOwnPropertyNames(staticError)),
+          datasetId: selectedDataset.id,
+          isPaid: selectedDataset.pricing.isPaid,
+          priceWei: selectedDataset.pricing.priceInFILWei.toString()
+        });
+        
+        throw new Error(`Purchase validation failed: ${revertReason}`);
+      }
+
+      const tx = await contract.purchaseDataset(BigInt(selectedDataset.id), paymentTokenAddress, {
+        gasLimit,
+      });
+
+      toast.loading('Waiting for transaction confirmation...', { id: 'purchase' });
+      const receipt = await tx.wait();
+
+      // Check receipt status
+      if (!receipt || receipt.status !== 1) {
+        setIsPurchasing(false);
+        throw new Error('Transaction reverted. Please check if you have sufficient balance and the dataset is available for purchase.');
+      }
+
+      setIsPurchaseConfirmed(true);
+      setIsPurchasing(false);
+      toast.success('Purchase successful!', { id: 'purchase' });
+
+      // Update local state
+      setMyPurchases((prev) => new Set([...prev, selectedDataset.id]));
+
+      // Close modal after a short delay
+      setTimeout(() => {
+        setPurchaseModalOpen(false);
+        setSelectedDataset(null);
+      }, 2000);
+    } catch (error: any) {
+      setIsPurchasing(false);
+      
+      // Extract more detailed error information
+      let errorMessage = 'Unknown error';
+      if (error?.reason) {
+        errorMessage = error.reason;
+      } else if (error?.message) {
+        errorMessage = error.message;
+      } else if (typeof error === 'string') {
+        errorMessage = error;
+      }
+      
+      // Log the full error for debugging
+      console.error('❌ Purchase transaction error:', {
+        error,
+        errorMessage,
+        datasetId: selectedDataset?.id,
+        isPaid: selectedDataset?.pricing.isPaid,
+        priceWei: selectedDataset?.pricing.priceInFILWei?.toString()
+      });
+      
+      // Check for common revert reasons
+      if (errorMessage.includes('Private dataset not for sale') || errorMessage.includes('private') && errorMessage.includes('not for sale')) {
+        throw new Error('This dataset is private and cannot be purchased. Private datasets are only accessible to the owner.');
+      } else if (errorMessage.includes('already purchased') || errorMessage.includes('already owns')) {
+        throw new Error('You have already purchased this dataset.');
+      } else if (errorMessage.includes('insufficient') || errorMessage.includes('balance')) {
+        throw new Error('Insufficient USDFC balance. Please ensure you have enough tokens.');
+      } else if (errorMessage.includes('not found') || errorMessage.includes('does not exist') || errorMessage.includes('Dataset does not exist')) {
+        throw new Error('Dataset not found. It may have been removed or the dataset ID is incorrect.');
+      } else if (errorMessage.includes('not for sale') || (errorMessage.includes('not available') && !errorMessage.includes('free') && !errorMessage.includes('private'))) {
+        // Only show "not available" if it's not about being free or private
+        throw new Error('This dataset is not available for purchase. It may be free or not listed for sale.');
+      } else if (errorMessage.includes('free') || errorMessage.includes('does not require purchase')) {
+        throw new Error('This dataset is free and does not require purchase. You can download it directly.');
+      }
+      
+      throw error;
+    }
+  };
+
+  // Reset purchase confirmation state when modal closes
+  useEffect(() => {
+    if (!purchaseModalOpen) {
+      setIsPurchaseConfirmed(false);
+      setIsApprovalConfirmed(false);
+      setNeedsApproval(false);
+      setApprovalTokenAddress(null);
+    }
+  }, [purchaseModalOpen]);
 
   // Helper to check if CID is FOC PieceCID (starts with 'bafk' or similar FOC patterns)
   const isFOCPieceCID = (cid: string): boolean => {
     return cid.startsWith('bafk') || cid.length > 60; // FOC PieceCIDs are typically longer
   };
 
+  // Helper to create professional PDF certificate/document
+  const createProfessionalDocument = async (dataset: Dataset): Promise<Blob> => {
+    const doc = new jsPDF({
+      orientation: 'portrait',
+      unit: 'mm',
+      format: 'a4'
+    });
+
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const margin = 20;
+    let yPos = margin;
+
+    // Helper function to add text with word wrap
+    const addText = (text: string, x: number, y: number, fontSize: number, isBold: boolean = false, color: [number, number, number] = [0, 0, 0]) => {
+      doc.setFontSize(fontSize);
+      doc.setFont('helvetica', isBold ? 'bold' : 'normal');
+      doc.setTextColor(color[0], color[1], color[2]);
+      
+      const maxWidth = pageWidth - (x * 2);
+      const lines = doc.splitTextToSize(text, maxWidth);
+      doc.text(lines, x, y);
+      return lines.length * (fontSize * 0.35); // Return height used
+    };
+
+    // Header with logo area
+    doc.setFillColor(37, 99, 235); // Blue
+    doc.rect(0, 0, pageWidth, 40, 'F');
+    
+    // Title
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(24);
+    doc.setFont('helvetica', 'bold');
+    doc.text('FileScope AI', pageWidth / 2, 20, { align: 'center' });
+    
+    doc.setFontSize(12);
+    doc.setFont('helvetica', 'normal');
+    doc.text('Decentralized Data Quality Platform', pageWidth / 2, 30, { align: 'center' });
+
+    yPos = 50;
+
+    // Certificate Header
+    doc.setTextColor(0, 0, 0);
+    doc.setFontSize(20);
+    doc.setFont('helvetica', 'bold');
+    doc.text('DATASET VERIFICATION CERTIFICATE', pageWidth / 2, yPos, { align: 'center' });
+    yPos += 10;
+
+    // Issued by section
+    doc.setFontSize(12);
+    doc.setFont('helvetica', 'normal');
+    doc.text('Issued by FileScope AI', pageWidth / 2, yPos, { align: 'center' });
+    yPos += 8;
+
+    // Date
+    const issueDate = new Date().toLocaleDateString('en-US', { 
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric' 
+    });
+    doc.text(`Date: ${issueDate}`, pageWidth / 2, yPos, { align: 'center' });
+    yPos += 15;
+
+    // Dataset Information Section
+    doc.setFillColor(240, 240, 240);
+    doc.rect(margin, yPos - 5, pageWidth - (margin * 2), 8, 'F');
+    doc.setFontSize(14);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Dataset Information', margin + 2, yPos);
+    yPos += 10;
+
+    doc.setFontSize(10);
+    doc.setFont('helvetica', 'normal');
+    yPos += addText(`Title: ${dataset.title}`, margin, yPos, 10);
+    yPos += 3;
+    yPos += addText(`Description: ${dataset.description || 'No description available'}`, margin, yPos, 10);
+    yPos += 3;
+    yPos += addText(`Upload Date: ${new Date(dataset.metadata.uploadDate).toLocaleDateString()}`, margin, yPos, 10);
+    yPos += 3;
+    yPos += addText(`Uploader: ${dataset.uploader.address}`, margin, yPos, 10);
+    yPos += 3;
+    yPos += addText(`Rows: ${dataset.metadata.rows.toLocaleString()} | Columns: ${dataset.metadata.columns} | Format: ${dataset.metadata.format || 'Unknown'}`, margin, yPos, 10);
+    yPos += 8;
+
+    // Quality Metrics Section
+    if (yPos > pageHeight - 60) {
+      doc.addPage();
+      yPos = margin;
+    }
+
+    doc.setFillColor(240, 240, 240);
+    doc.rect(margin, yPos - 5, pageWidth - (margin * 2), 8, 'F');
+    doc.setFontSize(14);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Quality Metrics', margin + 2, yPos);
+    yPos += 10;
+
+    doc.setFontSize(10);
+    doc.setFont('helvetica', 'normal');
+    yPos += addText(`Overall Quality Score: ${dataset.results.metrics.quality_score}%`, margin, yPos, 10);
+    yPos += 3;
+    yPos += addText(`Completeness: ${dataset.results.metrics.completeness}% | Consistency: ${dataset.results.metrics.consistency}%`, margin, yPos, 10);
+    yPos += 3;
+    yPos += addText(`Accuracy: ${dataset.results.metrics.accuracy}% | Validity: ${dataset.results.metrics.validity}%`, margin, yPos, 10);
+    yPos += 3;
+    yPos += addText(`Anomalies Detected: ${dataset.results.metrics.anomalies.total} (High: ${dataset.results.metrics.anomalies.high}, Medium: ${dataset.results.metrics.anomalies.medium}, Low: ${dataset.results.metrics.anomalies.low})`, margin, yPos, 10);
+    yPos += 8;
+
+    // Blockchain Verification Section
+    if (yPos > pageHeight - 60) {
+      doc.addPage();
+      yPos = margin;
+    }
+
+    doc.setFillColor(240, 240, 240);
+    doc.rect(margin, yPos - 5, pageWidth - (margin * 2), 8, 'F');
+    doc.setFontSize(14);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Blockchain Verification', margin + 2, yPos);
+    yPos += 10;
+
+    doc.setFontSize(10);
+    doc.setFont('helvetica', 'normal');
+    const storageType = dataset.metadata.isPublic && !dataset.metadata.isPrivate 
+      ? 'Filecoin Onchain Cloud (FOC)' 
+      : 'IPFS (InterPlanetary File System)';
+    yPos += addText(`Storage Type: ${storageType}`, margin, yPos, 10);
+    yPos += 3;
+    yPos += addText(`Contract Address: ${dataset.metadata.contractAddress}`, margin, yPos, 10);
+    yPos += 3;
+    yPos += addText(`Dataset CID: ${dataset.metadata.ipfsHash}`, margin, yPos, 10);
+    yPos += 3;
+    yPos += addText(`Analysis CID: ${dataset.metadata.analysisCID}`, margin, yPos, 10);
+    yPos += 3;
+    yPos += addText(`Verification Status: ✓ Verified on Blockchain`, margin, yPos, 10);
+    yPos += 3;
+    yPos += addText(`Public Dataset: ${dataset.metadata.isPublic ? 'Yes' : 'No'} | Monetization: ${dataset.pricing.isPaid ? `Yes - ${dataset.pricing.priceInFIL} USDFC` : 'Free'}`, margin, yPos, 10);
+    yPos += 8;
+
+    // Footer
+    if (yPos > pageHeight - 40) {
+      doc.addPage();
+      yPos = margin;
+    }
+
+    // Horizontal line
+    doc.setDrawColor(200, 200, 200);
+    doc.line(margin, yPos, pageWidth - margin, yPos);
+    yPos += 5;
+
+    // About section
+    doc.setFontSize(9);
+    doc.setFont('helvetica', 'italic');
+    yPos += addText('FileScope AI is a decentralized data quality and analysis platform powered by blockchain technology.', margin, yPos, 9);
+    yPos += 5;
+    yPos += addText('This dataset has been verified on the blockchain and is available for public use.', margin, yPos, 9);
+    yPos += 5;
+    yPos += addText('Visit: https://filescope.ai | Powered by Filecoin Onchain Cloud & IPFS', margin, yPos, 9);
+    yPos += 8;
+
+    // Verification seal
+    doc.setFillColor(37, 99, 235);
+    doc.circle(pageWidth / 2, yPos, 15, 'F');
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(12);
+    doc.setFont('helvetica', 'bold');
+    doc.text('VERIFIED', pageWidth / 2, yPos + 2, { align: 'center' });
+    doc.setFontSize(8);
+    doc.text('BLOCKCHAIN', pageWidth / 2, yPos + 6, { align: 'center' });
+
+    // Page numbers
+    const pageCount = doc.getNumberOfPages();
+    for (let i = 1; i <= pageCount; i++) {
+      doc.setPage(i);
+      doc.setFontSize(8);
+      doc.setTextColor(150, 150, 150);
+      doc.text(`Page ${i} of ${pageCount}`, pageWidth / 2, pageHeight - 10, { align: 'center' });
+    }
+
+    // Generate blob
+    const pdfBlob = doc.output('blob');
+    return pdfBlob;
+  };
+
+  // Helper to create branded README file (kept for backward compatibility)
+  const createBrandedREADME = (dataset: Dataset): string => {
+    const timestamp = new Date().toISOString();
+    const storageType = dataset.metadata.isPublic && !dataset.metadata.isPrivate 
+      ? 'Filecoin Onchain Cloud (FOC)' 
+      : 'IPFS (InterPlanetary File System)';
+    
+    return `# Dataset: ${dataset.title}
+
+## Issued by FileScope AI
+
+This dataset has been analyzed and verified by **FileScope AI**, a decentralized data quality and analysis platform powered by blockchain technology.
+
+---
+
+### Dataset Information
+- **Title**: ${dataset.title}
+- **Description**: ${dataset.description || 'No description available'}
+- **Upload Date**: ${new Date(dataset.metadata.uploadDate).toLocaleDateString()}
+- **Uploader Address**: ${dataset.uploader.address}
+- **Rows**: ${dataset.metadata.rows.toLocaleString()}
+- **Columns**: ${dataset.metadata.columns}
+- **Format**: ${dataset.metadata.format || 'Unknown'}
+- **File Size**: ${dataset.metadata.fileSize || 'Unknown'}
+
+### Quality Metrics
+- **Overall Quality Score**: ${dataset.results.metrics.quality_score}%
+- **Completeness**: ${dataset.results.metrics.completeness}%
+- **Consistency**: ${dataset.results.metrics.consistency}%
+- **Accuracy**: ${dataset.results.metrics.accuracy}%
+- **Validity**: ${dataset.results.metrics.validity}%
+- **Anomalies Detected**: ${dataset.results.metrics.anomalies.total}
+  - High Severity: ${dataset.results.metrics.anomalies.high}
+  - Medium Severity: ${dataset.results.metrics.anomalies.medium}
+  - Low Severity: ${dataset.results.metrics.anomalies.low}
+
+### Blockchain Verification
+- **Contract Address**: ${dataset.metadata.contractAddress}
+- **Storage Type**: ${storageType}
+- **Dataset CID**: ${dataset.metadata.ipfsHash}
+- **Analysis CID**: ${dataset.metadata.analysisCID}
+- **Verification Status**: ✓ Verified on Blockchain
+- **Public Dataset**: ${dataset.metadata.isPublic ? 'Yes' : 'No'}
+- **Monetization**: ${dataset.pricing.isPaid ? `Yes - ${dataset.pricing.priceInFIL} USDFC` : 'Free'}
+
+### Download Information
+- **Downloaded**: ${timestamp}
+- **Source**: FileScope AI Explorer
+- **License**: Please check dataset metadata for licensing information
+
+---
+
+## About FileScope AI
+
+**FileScope AI** is a decentralized data quality and analysis platform that leverages blockchain technology to ensure data integrity, transparency, and accessibility.
+
+### Key Features:
+- ✓ Blockchain-verified datasets
+- ✓ AI-powered quality analysis
+- ✓ Decentralized storage (Filecoin Onchain Cloud & IPFS)
+- ✓ Transparent data provenance
+- ✓ Monetization support for data creators
+
+### Technology Stack:
+- **Storage**: Filecoin Onchain Cloud (FOC) for public datasets, IPFS for private datasets
+- **Blockchain**: Filecoin Calibration Testnet
+- **Smart Contracts**: Ethereum-compatible (Filecoin EVM)
+
+---
+
+**FileScope AI** - Decentralized Data Quality Platform
+🌐 Visit: https://filescope.ai
+🔗 Powered by Filecoin Onchain Cloud & IPFS
+📊 Verified on Blockchain
+
+This dataset has been verified on the blockchain and is available for public use.
+For questions or support, please visit our platform.
+
+---
+*Generated by FileScope AI on ${new Date().toLocaleString()}*
+`;
+  };
+
   // Download original dataset (handles both IPFS and FOC)
   const downloadOriginalDataset = async (dataset: Dataset) => {
+    // Check if dataset requires purchase
+    if (dataset.pricing.isPaid && !dataset.isPurchased) {
+      toast.error('Please purchase this dataset first to download it.');
+      return;
+    }
+
     try {
       toast.loading('Downloading original dataset...', { id: 'download-original' });
       
       let data: Blob;
       const cid = dataset.metadata.ipfsHash;
 
-      if (isFOCPieceCID(cid)) {
-        // Download from FOC
+      // Public datasets use FOC, private datasets use IPFS
+      if (dataset.metadata.isPublic && !dataset.metadata.isPrivate) {
+        // Public dataset - download from FOC
         if (!window.ethereum) {
           throw new Error('Ethereum provider not found');
         }
@@ -1128,18 +1651,23 @@ const DatasetExplorer = () => {
         const fileData = await focService.downloadDataset(cid);
         data = new Blob([fileData], { type: 'application/octet-stream' });
       } else {
-        // Download from IPFS
-        const response = await fetch(`https://gateway.pinata.cloud/ipfs/${cid}`);
-      if (!response.ok) {
-        throw new Error('Failed to fetch original dataset');
-      }
-        data = await response.blob();
+        // Private dataset - download from IPFS using fallback gateways
+        data = await fetchFromIPFS(cid);
       }
 
-      const url = window.URL.createObjectURL(data);
+      // Create professional PDF certificate
+      const certificatePDF = await createProfessionalDocument(dataset);
+      
+      // Create branded ZIP with dataset and certificate
+      const zip = new JSZip();
+      zip.file(`${dataset.metadata.fileName || 'dataset'}.json`, data);
+      zip.file(`${dataset.metadata.fileName || 'dataset'}-Certificate.pdf`, certificatePDF);
+      
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = window.URL.createObjectURL(content);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${dataset.metadata.fileName || 'dataset'}.json`;
+      a.download = `${dataset.metadata.fileName || 'dataset'}-filescope-ai.zip`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -1153,19 +1681,31 @@ const DatasetExplorer = () => {
 
   // Download analysis results (PDF) - analysis is always on IPFS
   const downloadAnalysisResults = async (dataset: Dataset) => {
+    // Check if dataset requires purchase
+    if (dataset.pricing.isPaid && !dataset.isPurchased) {
+      toast.error('Please purchase this dataset first to download the analysis report.');
+      return;
+    }
+
     try {
       toast.loading('Downloading analysis report...', { id: 'download-analysis' });
-      // Analysis CID is stored in metadata
+      // Analysis CID is stored in metadata (always on IPFS)
       const analysisCID = dataset.metadata.analysisCID;
-      const response = await fetch(`https://gateway.pinata.cloud/ipfs/${analysisCID}`);
-      if (!response.ok) {
-        throw new Error('Failed to fetch analysis report');
-      }
-      const data = await response.blob();
-      const url = window.URL.createObjectURL(data);
+      const data = await fetchFromIPFS(analysisCID);
+      
+      // Create professional PDF certificate
+      const certificatePDF = await createProfessionalDocument(dataset);
+      
+      // Create branded ZIP with analysis and certificate
+      const zip = new JSZip();
+      zip.file(`${dataset.metadata.fileName || 'dataset'}-analysis.pdf`, data);
+      zip.file(`${dataset.metadata.fileName || 'dataset'}-Certificate.pdf`, certificatePDF);
+      
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = window.URL.createObjectURL(content);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${dataset.metadata.fileName || 'dataset'}-analysis.pdf`;
+      a.download = `${dataset.metadata.fileName || 'dataset'}-analysis-filescope-ai.zip`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -1179,14 +1719,21 @@ const DatasetExplorer = () => {
 
   // Download complete dataset (original + analysis)
   const downloadCompleteDataset = async (dataset: Dataset) => {
+    // Check if dataset requires purchase
+    if (dataset.pricing.isPaid && !dataset.isPurchased) {
+      toast.error('Please purchase this dataset first to download it.');
+      return;
+    }
+
     try {
       toast.loading('Downloading complete dataset package...', { id: 'download-complete' });
       
       const datasetCID = dataset.metadata.ipfsHash;
       let originalData: Blob;
 
-      // Download original dataset (from FOC or IPFS)
-      if (isFOCPieceCID(datasetCID)) {
+      // Public datasets use FOC, private datasets use IPFS
+      if (dataset.metadata.isPublic && !dataset.metadata.isPrivate) {
+        // Public dataset - download from FOC
         if (!window.ethereum) {
           throw new Error('Ethereum provider not found');
         }
@@ -1195,31 +1742,28 @@ const DatasetExplorer = () => {
         const fileData = await focService.downloadDataset(datasetCID);
         originalData = new Blob([fileData], { type: 'application/octet-stream' });
       } else {
-        const originalResponse = await fetch(`https://gateway.pinata.cloud/ipfs/${datasetCID}`);
-      if (!originalResponse.ok) {
-        throw new Error('Failed to fetch original dataset');
-      }
-        originalData = await originalResponse.blob();
+        // Private dataset - download from IPFS using fallback gateways
+        originalData = await fetchFromIPFS(datasetCID);
       }
 
-      // Download analysis (always from IPFS)
+      // Download analysis (always from IPFS using fallback gateways)
       const analysisCID = dataset.metadata.analysisCID;
-      const analysisResponse = await fetch(`https://gateway.pinata.cloud/ipfs/${analysisCID}`);
-      if (!analysisResponse.ok) {
-        throw new Error('Failed to fetch analysis report');
-      }
-      const analysisData = await analysisResponse.blob();
+      const analysisData = await fetchFromIPFS(analysisCID);
 
-      // Create ZIP
+      // Create professional PDF certificate
+      const certificatePDF = await createProfessionalDocument(dataset);
+
+      // Create branded ZIP with dataset, analysis, and certificate
       const zip = new JSZip();
       zip.file(`${dataset.metadata.fileName || 'dataset'}.json`, originalData);
       zip.file(`${dataset.metadata.fileName || 'dataset'}-analysis.pdf`, analysisData);
+      zip.file(`${dataset.metadata.fileName || 'dataset'}-Certificate.pdf`, certificatePDF);
 
       const content = await zip.generateAsync({ type: 'blob' });
       const url = window.URL.createObjectURL(content);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${dataset.metadata.fileName || 'dataset'}-complete.zip`;
+      a.download = `${dataset.metadata.fileName || 'dataset'}-complete-filescope-ai.zip`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -1239,12 +1783,12 @@ const DatasetExplorer = () => {
       <div className="fixed inset-0 z-50 flex items-center justify-center">
         <div 
           className="fixed inset-0 bg-black bg-opacity-50 transition-opacity" 
-          onClick={() => !isPurchasing && !isConfirming && setPurchaseModalOpen(false)}
+          onClick={() => !isPurchasing && !isApproving && setPurchaseModalOpen(false)}
         ></div>
         <div className="relative bg-white dark:bg-gray-800 rounded-xl shadow-2xl max-w-md w-full mx-4 p-6">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Purchase Dataset</h2>
-            {!isPurchasing && !isConfirming && (
+            {!isPurchasing && !isApproving && (
               <button
                 onClick={() => setPurchaseModalOpen(false)}
                 className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
@@ -1261,19 +1805,36 @@ const DatasetExplorer = () => {
             <p className="text-gray-600 dark:text-gray-300 text-sm mb-4">
               {selectedDataset.description}
             </p>
-            <div className="bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-blue-900/20 dark:to-indigo-900/20 rounded-lg p-4 border border-blue-200 dark:border-blue-800">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-gray-700 dark:text-gray-300 font-medium">Price:</span>
-                <span className="text-2xl font-bold text-blue-600 dark:text-blue-400">
-                  {selectedDataset.pricing.priceInFIL} USDFC
-                </span>
+            {selectedDataset.pricing.isPaid && selectedDataset.pricing.priceInFILWei > BigInt(0) ? (
+              <div className="bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-blue-900/20 dark:to-indigo-900/20 rounded-lg p-4 border border-blue-200 dark:border-blue-800">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-gray-700 dark:text-gray-300 font-medium">Price:</span>
+                  <span className="text-2xl font-bold text-blue-600 dark:text-blue-400">
+                    {selectedDataset.pricing.priceInFIL} USDFC
+                  </span>
+                </div>
+                <div className="text-xs text-gray-600 dark:text-gray-400 mt-2">
+                  ✓ One-time purchase - permanent access<br />
+                  ✓ Download unlimited times after purchase<br />
+                  ✓ Download dataset and analysis report<br />
+                  ✓ Blockchain-verified ownership
+                </div>
               </div>
-              <div className="text-xs text-gray-600 dark:text-gray-400 mt-2">
-                ✓ Instant access after purchase<br />
-                ✓ Download dataset and analysis report<br />
-                ✓ Permanent ownership
+            ) : (
+              <div className="bg-gradient-to-br from-green-50 to-emerald-50 dark:from-green-900/20 dark:to-emerald-900/20 rounded-lg p-4 border border-green-200 dark:border-green-800">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-gray-700 dark:text-gray-300 font-medium">Status:</span>
+                  <span className="text-2xl font-bold text-green-600 dark:text-green-400">
+                    Free
+                  </span>
+                </div>
+                <div className="text-xs text-gray-600 dark:text-gray-400 mt-2">
+                  ✓ Free to download<br />
+                  ✓ No purchase required<br />
+                  ✓ Open access dataset
+                </div>
               </div>
-            </div>
+            )}
           </div>
 
           {isPurchaseConfirmed ? (
@@ -1287,17 +1848,17 @@ const DatasetExplorer = () => {
             <div className="flex space-x-3">
               <button
                 onClick={() => setPurchaseModalOpen(false)}
-                disabled={isPurchasing || isConfirming || isApproving || isApprovalConfirming}
+                disabled={isPurchasing || isApproving}
                 className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Cancel
               </button>
               <button
                 onClick={executePurchase}
-                disabled={isPurchasing || isConfirming || isApproving || isApprovalConfirming}
+                disabled={isPurchasing || isApproving}
                 className="flex-1 px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white rounded-lg font-medium transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center space-x-2"
               >
-                {isApproving || isApprovalConfirming ? (
+                {isApproving ? (
                   <>
                     <span className="animate-spin">⏳</span>
                     <span>Approving token...</span>
@@ -1305,12 +1866,7 @@ const DatasetExplorer = () => {
                 ) : isPurchasing ? (
                   <>
                     <span className="animate-spin">⏳</span>
-                    <span>Waiting for wallet...</span>
-                  </>
-                ) : isConfirming ? (
-                  <>
-                    <span className="animate-spin">⏳</span>
-                    <span>Confirming...</span>
+                    <span>Processing purchase...</span>
                   </>
                 ) : (
                   <>
@@ -1471,13 +2027,17 @@ const DatasetExplorer = () => {
             }`}>
               {dataset.category}
             </span>
-            {dataset.pricing.isPaid && (
+            {dataset.pricing.isPaid && dataset.pricing.priceInFILWei > BigInt(0) ? (
               <span className={`px-2 py-1 text-xs font-medium rounded-full ${
                 dataset.isPurchased 
                   ? 'bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-300' 
                   : 'bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-300'
               }`}>
                 {dataset.isPurchased ? 'Owned' : `${dataset.pricing.priceInFIL} USDFC`}
+              </span>
+            ) : (
+              <span className="px-2 py-1 text-xs font-medium rounded-full bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-300">
+                Free
               </span>
             )}
           </div>

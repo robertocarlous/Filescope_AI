@@ -184,17 +184,17 @@ def upload_dataset(request):
                 {'success': False, 'error': 'No file provided', 'error_code': 'NO_FILE'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-
+        
         file = request.FILES['file']
         dataset_name = request.POST.get('name', file.name)
         dataset_description = request.POST.get('description', '')
-
+        
         # ---- query params ----
         include_viz = request.query_params.get('include_visualizations', 'false').lower() == 'true'
         analysis_depth = request.query_params.get('analysis_depth', 'basic')
         strict_format = request.query_params.get('strict_format', 'false').lower() == 'true'
-
-        result = process_uploaded_file_smart(
+        
+            result = process_uploaded_file_smart(
             file=file,
             name=dataset_name,
             description=dataset_description,
@@ -203,8 +203,8 @@ def upload_dataset(request):
             strict_format=strict_format,
             user=request.user if request.user.is_authenticated else None
         )
-        return Response(result, status=status.HTTP_200_OK)
-
+            return Response(result, status=status.HTTP_200_OK)
+            
     except Exception as exc:
         logger.exception("upload_dataset unexpected error")
         return Response(
@@ -236,7 +236,7 @@ def process_uploaded_file_smart(file, name, description,
 
     # ---- 4. Persist file & create DB record ----
     stored_path = default_storage.save(f'datasets/{uuid.uuid4()}_{file.name}', file)
-
+    
     analysis = DatasetAnalysis.objects.create(
         user=user,
         dataset_file=stored_path,
@@ -245,16 +245,16 @@ def process_uploaded_file_smart(file, name, description,
         columns_count=int(dataset_info.get('columns', 0)),
         dataset_size=f"{dataset_info.get('size_bytes', 0)} bytes"
     )
-
+    
     try:
         # ---- 5. Run the smart analysis ----
         results = analyze_dataset_smart(df, dataset_info, file_issues, depth=analysis_depth)
-
+        
         # ---- 6. Visualisations (optional) ----
         visualizations = {}
         if include_viz:
             visualizations = generate_visualizations_smart(df, file_issues)
-
+        
         # ---- 7. Populate model fields ----
         analysis.status = 'completed'
         analysis.quality_score = float(results['quality_score']['total_score'])
@@ -276,7 +276,7 @@ def process_uploaded_file_smart(file, name, description,
             **dataset_info
         }
         analysis.full_analysis = results
-
+        
         # Human-readable insights
         all_insights = results.get('insights', [])
         if file_issues:
@@ -290,7 +290,7 @@ def process_uploaded_file_smart(file, name, description,
         analysis.visualization_data = visualizations
 
         analysis.save()
-
+        
         # ---- 8. Build response ----
         resp = {
             'success': True,
@@ -312,9 +312,9 @@ def process_uploaded_file_smart(file, name, description,
         }
         if include_viz:
             resp['visualizations']['data'] = visualizations
-
+        
         return resp
-
+        
     except Exception as exc:
         analysis.status = 'failed'
         analysis.error_message = str(exc)
@@ -364,9 +364,9 @@ def smart_file_parser(file, declared_extension):
                     'recommendation': 'Consider renaming to .json'
                 })
             if isinstance(data, dict):
-                df = pd.DataFrame([data])
+                    df = pd.DataFrame([data])
             elif isinstance(data, list) and data:
-                df = pd.DataFrame(data)
+                    df = pd.DataFrame(data)
             else:
                 df = pd.DataFrame({'value': [data]})
             dataset_info['actual_content_type'] = actual_content_type
@@ -378,20 +378,20 @@ def smart_file_parser(file, declared_extension):
             pass
     
     # 2. Try CSV/TSV for .txt (smart detection via commas/tabs)
-    lines = content_preview.split('\n')[:10]
-    comma_counts = [line.count(',') for line in lines if line.strip()]
+            lines = content_preview.split('\n')[:10]
+            comma_counts = [line.count(',') for line in lines if line.strip()]
     tab_counts = [line.count('\t') for line in lines if line.strip()]
-    
+            
     if max(comma_counts) >= 1 or declared_extension == '.csv':
         try:
-            df = pd.read_csv(StringIO(content_str))
-            actual_content_type = 'csv'
-            if declared_extension != '.csv':
-                file_issues.append({
+                df = pd.read_csv(StringIO(content_str))
+                actual_content_type = 'csv'
+                if declared_extension != '.csv':
+                    file_issues.append({
                     'type': 'extension_mismatch', 'severity': 'medium',
-                    'message': f'File contains CSV data but has {declared_extension} extension',
-                    'recommendation': 'Consider renaming to .csv'
-                })
+                        'message': f'File contains CSV data but has {declared_extension} extension',
+                        'recommendation': 'Consider renaming to .csv'
+                    })
             dataset_info['actual_content_type'] = actual_content_type
             dataset_info['rows'] = len(df)
             dataset_info['columns'] = len(df.columns)
@@ -414,17 +414,17 @@ def smart_file_parser(file, declared_extension):
     
     # 3. Fallback: Document mode for .txt (line-by-line)
     lines = content_str.split('\n')
-    df = pd.DataFrame({
+            df = pd.DataFrame({
         'line_number': range(1, len(lines) + 1),
         'content': [line.strip() for line in lines],
         'char_count': [len(line) for line in lines]
-    })
-    actual_content_type = 'document'
-    file_issues.append({
+            })
+            actual_content_type = 'document'
+            file_issues.append({
         'type': 'document_parsed', 'severity': 'info',
         'message': 'Text file converted to line-by-line analysis format',
-        'recommendation': 'Text content extracted for analysis'
-    })
+                'recommendation': 'Text content extracted for analysis'
+            })
     dataset_info['actual_content_type'] = actual_content_type
     dataset_info['rows'] = len(df)
     dataset_info['columns'] = len(df.columns)
